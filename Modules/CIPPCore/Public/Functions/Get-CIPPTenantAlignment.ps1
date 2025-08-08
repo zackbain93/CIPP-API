@@ -34,7 +34,7 @@ function Get-CIPPTenantAlignment {
             $JSON = $_.JSON -replace '"Action":', '"action":'
             try {
                 $RowKey = $_.RowKey
-                $Data = $JSON | ConvertFrom-Json -Depth 100 -ErrorAction SilentlyContinue
+                $Data = $JSON | ConvertFrom-Json -Depth 100 -ErrorAction Stop
             } catch {
                 Write-Warning "$($RowKey) standard could not be loaded: $($_.Exception.Message)"
                 return
@@ -52,7 +52,7 @@ function Get-CIPPTenantAlignment {
 
         # Get standards comparison data
         $StandardsTable = Get-CIPPTable -TableName 'CippStandardsReports'
-        $AllStandards = Get-CIPPAzDataTableEntity @StandardsTable
+        $AllStandards = Get-CIPPAzDataTableEntity @StandardsTable -Filter "PartitionKey ne 'StandardReport' and PartitionKey ne ''"
 
         # Filter by tenant if specified
         $Standards = if ($TenantFilter) {
@@ -71,8 +71,16 @@ function Get-CIPPTenantAlignment {
             # Process field value
             if ($FieldValue -is [System.Boolean]) {
                 $FieldValue = [bool]$FieldValue
-            } elseif ($FieldValue -like '*{*') {
-                $FieldValue = ConvertFrom-Json -InputObject $FieldValue -ErrorAction SilentlyContinue
+            } elseif (Test-Json -Json $FieldValue -ErrorAction SilentlyContinue) {
+                try {
+                    $FieldValue = ConvertFrom-Json -Depth 100 -InputObject $FieldValue -ErrorAction Stop
+                } catch {
+                    Write-Warning "$($FieldName) standard report could not be loaded: $($_.Exception.Message)"
+                    $FieldValue = [PSCustomObject]@{
+                        Error         = "Invalid JSON format: $($_.Exception.Message)"
+                        OriginalValue = $FieldValue
+                    }
+                }
             } else {
                 $FieldValue = [string]$FieldValue
             }
@@ -101,7 +109,13 @@ function Get-CIPPTenantAlignment {
 
             if ($Template.tenantFilter -and $Template.tenantFilter.Count -gt 0) {
                 # Extract tenant values from the tenantFilter array
-                $TenantValues = $Template.tenantFilter | ForEach-Object { $_.value }
+                $TenantValues = $Template.tenantFilter | ForEach-Object {
+                    if ($_.type -eq 'group') {
+                        (Get-TenantGroups -GroupId $_.value).members.defaultDomainName
+                    } else {
+                        $_.value
+                    }
+                }
 
                 if ($TenantValues -contains 'AllTenants') {
                     $AppliestoAllTenants = $true
@@ -141,6 +155,21 @@ function Get-CIPPTenantAlignment {
                             [PSCustomObject]@{
                                 StandardId       = $IntuneStandardId
                                 ReportingEnabled = $IntuneReportingEnabled
+                            }
+                        }
+                    }
+                }
+                # Handle Conditional Access templates specially
+                elseif ($StandardKey -eq 'ConditionalAccessTemplate' -and $StandardConfig -is [array]) {
+                    foreach ($CATemplate in $StandardConfig) {
+                        if ($CATemplate.TemplateList.value) {
+                            $CAStandardId = "standards.ConditionalAccessTemplate.$($CATemplate.TemplateList.value)"
+                            $CAActions = if ($CATemplate.action) { $CATemplate.action } else { @() }
+                            $CAReportingEnabled = ($CAActions | Where-Object { $_.value -and ($_.value.ToLower() -eq 'report' -or $_.value.ToLower() -eq 'remediate') }).Count -gt 0
+
+                            [PSCustomObject]@{
+                                StandardId       = $CAStandardId
+                                ReportingEnabled = $CAReportingEnabled
                             }
                         }
                     }
@@ -236,6 +265,10 @@ function Get-CIPPTenantAlignment {
                     TenantFilter             = $TenantName
                     StandardName             = $Template.templateName
                     StandardId               = $Template.GUID
+                    standardType             = $Template.type
+                    standardSettings         = $Template.Standards
+                    driftAlertEmail          = $Template.driftAlertEmail
+                    driftAlertWebhook        = $Template.driftAlertWebhook
                     AlignmentScore           = $AlignmentPercentage
                     LicenseMissingPercentage = $LicenseMissingPercentage
                     CombinedScore            = $AlignmentPercentage + $LicenseMissingPercentage
@@ -255,6 +288,7 @@ function Get-CIPPTenantAlignment {
         return $Results
     } catch {
         Write-Error "Error getting tenant alignment data: $($_.Exception.Message)"
+        Write-Information $_.InvocationInfo.PositionMessage
         throw
     }
 }
