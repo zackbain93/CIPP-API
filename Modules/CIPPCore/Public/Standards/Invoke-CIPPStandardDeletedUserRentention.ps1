@@ -29,7 +29,7 @@ function Invoke-CIPPStandardDeletedUserRentention {
     #>
 
     param($Tenant, $Settings)
-    $TestResult = Test-CIPPStandardLicense -StandardName 'DeletedUserRentention' -TenantFilter $Tenant -RequiredCapabilities @('SHAREPOINTWAC', 'SHAREPOINTSTANDARD', 'SHAREPOINTENTERPRISE', 'ONEDRIVE_BASIC', 'ONEDRIVE_ENTERPRISE')
+    $TestResult = Test-CIPPStandardLicense -StandardName 'DeletedUserRentention' -TenantFilter $Tenant -RequiredCapabilities @('SHAREPOINTWAC', 'SHAREPOINTSTANDARD', 'SHAREPOINTENTERPRISE', 'SHAREPOINTENTERPRISE_EDU','ONEDRIVE_BASIC', 'ONEDRIVE_ENTERPRISE')
     ##$Rerun -Type Standard -Tenant $Tenant -Settings $Settings 'DeletedUserRetention'
 
     if ($TestResult -eq $false) {
@@ -37,7 +37,14 @@ function Invoke-CIPPStandardDeletedUserRentention {
         return $true
     } #we're done.
 
-    $CurrentInfo = New-GraphGetRequest -Uri 'https://graph.microsoft.com/beta/admin/sharepoint/settings' -tenantid $Tenant -AsApp $true
+    try {
+        $CurrentInfo = New-GraphGetRequest -Uri 'https://graph.microsoft.com/beta/admin/sharepoint/settings' -tenantid $Tenant -AsApp $true
+    }
+    catch {
+        $ErrorMessage = Get-NormalizedError -Message $_.Exception.Message
+        Write-LogMessage -API 'Standards' -Tenant $Tenant -Message "Could not get the DeletedUserRetention state for $Tenant. Error: $ErrorMessage" -Sev Error
+        return
+    }
     $Days = $Settings.Days.value ?? $Settings.Days
 
     if ($Settings.report -eq $true) {

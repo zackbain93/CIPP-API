@@ -30,15 +30,22 @@ function Invoke-CIPPStandardSPAzureB2B {
     #>
 
     param($Tenant, $Settings)
-    $TestResult = Test-CIPPStandardLicense -StandardName 'SPAzureB2B' -TenantFilter $Tenant -RequiredCapabilities @('SHAREPOINTWAC', 'SHAREPOINTSTANDARD', 'SHAREPOINTENTERPRISE', 'ONEDRIVE_BASIC', 'ONEDRIVE_ENTERPRISE')
+    $TestResult = Test-CIPPStandardLicense -StandardName 'SPAzureB2B' -TenantFilter $Tenant -RequiredCapabilities @('SHAREPOINTWAC', 'SHAREPOINTSTANDARD', 'SHAREPOINTENTERPRISE', 'SHAREPOINTENTERPRISE_EDU','ONEDRIVE_BASIC', 'ONEDRIVE_ENTERPRISE')
 
     if ($TestResult -eq $false) {
         Write-Host "We're exiting as the correct license is not present for this standard."
         return $true
     } #we're done.
 
-    $CurrentState = Get-CIPPSPOTenant -TenantFilter $Tenant |
+    try {
+        $CurrentState = Get-CIPPSPOTenant -TenantFilter $Tenant |
         Select-Object -Property _ObjectIdentity_, TenantFilter, EnableAzureADB2BIntegration
+    }
+    catch {
+        $ErrorMessage = Get-NormalizedError -Message $_.Exception.Message
+        Write-LogMessage -API 'Standards' -Tenant $Tenant -Message "Could not get the SPAzureB2B state for $Tenant. Error: $ErrorMessage" -Sev Error
+        return
+    }
 
     $StateIsCorrect = ($CurrentState.EnableAzureADB2BIntegration -eq $true)
 
