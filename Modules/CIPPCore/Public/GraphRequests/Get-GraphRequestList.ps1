@@ -33,6 +33,9 @@ function Get-GraphRequestList {
     .PARAMETER NoPagination
     Disable pagination
 
+    .PARAMETER ManualPagination
+    Enable manual pagination using nextLink
+
     .PARAMETER CountOnly
     Only return count of results
 
@@ -44,6 +47,12 @@ function Get-GraphRequestList {
 
     .PARAMETER ReverseTenantLookupProperty
     Property to perform reverse tenant lookup
+
+    .PARAMETER AsApp
+    Run the request as an application
+
+    .PARAMETER Caller
+    Name of the calling function
 
     #>
     [CmdletBinding()]
@@ -61,11 +70,13 @@ function Get-GraphRequestList {
         [switch]$SkipCache,
         [switch]$ClearCache,
         [switch]$NoPagination,
+        [switch]$ManualPagination,
         [switch]$CountOnly,
         [switch]$NoAuthCheck,
         [switch]$ReverseTenantLookup,
         [string]$ReverseTenantLookupProperty = 'tenantId',
-        [boolean]$AsApp = $false
+        [boolean]$AsApp = $false,
+        [string]$Caller = 'Get-GraphRequestList'
     )
 
     $SingleTenantThreshold = 8000
@@ -89,7 +100,16 @@ function Get-GraphRequestList {
             $Item.Value = $Item.Value.ToString().ToLower()
         }
         if ($Item.Value) {
-            $ParamCollection.Add($Item.Key, $Item.Value)
+            if ($Item.Key -eq '$select' -or $Item.Key -eq 'select') {
+                $Columns = $Item.Value -split ','
+                $ActualCols = foreach ($Col in $Columns) {
+                    $Col -split '\.' | Select-Object -First 1
+                }
+                $Value = ($ActualCols | Sort-Object -Unique) -join ','
+            } else {
+                $Value = $Item.Value
+            }
+            $ParamCollection.Add($Item.Key, $Value)
         }
     }
     $GraphQuery.Query = $ParamCollection.ToString()
@@ -104,8 +124,8 @@ function Get-GraphRequestList {
             tenantid      = $TenantFilter
             ComplexFilter = $true
         }
-        if ($NoPagination.IsPresent) {
-            $GraphRequest.noPagination = $NoPagination.IsPresent
+        if ($NoPagination.IsPresent -or $ManualPagination.IsPresent) {
+            $GraphRequest.noPagination = $true
         }
         if ($CountOnly.IsPresent) {
             $GraphRequest.CountOnly = $CountOnly.IsPresent
@@ -123,7 +143,16 @@ function Get-GraphRequestList {
             $GraphQuery = [System.UriBuilder]('https://graph.microsoft.com/{0}/{1}' -f $Version, $Endpoint)
             $ParamCollection = [System.Web.HttpUtility]::ParseQueryString([String]::Empty)
             foreach ($Item in ($Parameters.GetEnumerator() | Sort-Object -CaseSensitive -Property Key)) {
-                $Value = Get-CIPPTextReplacement -TenantFilter $TenantFilter -Text $Item.Value
+                if ($Item.Key -eq '$select' -or $Item.Key -eq 'select') {
+                    $Columns = $Item.Value -split ','
+                    $ActualCols = foreach ($Col in $Columns) {
+                        $Col -split '\.' | Select-Object -First 1
+                    }
+                    $Value = ($ActualCols | Sort-Object -Unique) -join ','
+                } else {
+                    $Value = $Item.Value
+                }
+                $Value = Get-CIPPTextReplacement -TenantFilter $TenantFilter -Text $Value
                 $ParamCollection.Add($Item.Key, $Value)
             }
             $GraphQuery.Query = $ParamCollection.ToString()
@@ -146,7 +175,7 @@ function Get-GraphRequestList {
             $Type = 'Queue'
             Write-Information "Cached: $(($Rows | Measure-Object).Count) rows (Type: $($Type))"
             $QueueReference = '{0}-{1}' -f $TenantFilter, $PartitionKey
-            $RunningQueue = Invoke-ListCippQueue | Where-Object { $_.Reference -eq $QueueReference -and $_.Status -ne 'Completed' -and $_.Status -ne 'Failed' }
+            $RunningQueue = Invoke-ListCippQueue -Reference $QueueReference | Where-Object { $_.Status -ne 'Completed' -and $_.Status -ne 'Failed' }
         } elseif (!$SkipCache.IsPresent -and !$ClearCache.IsPresent -and !$CountOnly.IsPresent) {
             if ($TenantFilter -eq 'AllTenants' -or $Count -gt $SingleTenantThreshold) {
                 $Table = Get-CIPPTable -TableName $TableName
@@ -160,7 +189,7 @@ function Get-GraphRequestList {
                 $Type = 'Cache'
                 Write-Information "Cached: $(($Rows | Measure-Object).Count) rows (Type: $($Type))"
                 $QueueReference = '{0}-{1}' -f $TenantFilter, $PartitionKey
-                $RunningQueue = Invoke-ListCippQueue | Where-Object { $_.Reference -eq $QueueReference -and $_.Status -notmatch 'Completed' -and $_.Status -notmatch 'Failed' }
+                $RunningQueue = Invoke-ListCippQueue -Reference $QueueReference | Where-Object { $_.Status -notmatch 'Completed' -and $_.Status -notmatch 'Failed' }
             }
         }
     } catch {
@@ -297,9 +326,9 @@ function Get-GraphRequestList {
 
                     if (!$QueueThresholdExceeded) {
                         #nextLink should ONLY be used in direct calls with manual pagination. It should not be used in queueing
-                        if ($NoPagination.IsPresent -and $nextLink -match '^https://.+') { $GraphRequest.uri = $nextLink }
+                        if ($ManualPagination.IsPresent -and $nextLink -match '^https://.+') { $GraphRequest.uri = $nextLink }
 
-                        $GraphRequestResults = New-GraphGetRequest @GraphRequest -Caller 'Get-GraphRequestList' -ErrorAction Stop
+                        $GraphRequestResults = New-GraphGetRequest @GraphRequest -Caller $Caller -ErrorAction Stop
                         $GraphRequestResults = $GraphRequestResults | Select-Object *, @{n = 'Tenant'; e = { $TenantFilter } }, @{n = 'CippStatus'; e = { 'Good' } }
 
                         if ($ReverseTenantLookup -and $GraphRequestResults) {

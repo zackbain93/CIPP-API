@@ -30,7 +30,7 @@ function Invoke-CIPPStandardDefaultSharingLink {
     #>
 
     param($Tenant, $Settings)
-    $TestResult = Test-CIPPStandardLicense -StandardName 'DefaultSharingLink' -TenantFilter $Tenant -RequiredCapabilities @('SHAREPOINTWAC', 'SHAREPOINTSTANDARD', 'SHAREPOINTENTERPRISE', 'ONEDRIVE_BASIC', 'ONEDRIVE_ENTERPRISE')
+    $TestResult = Test-CIPPStandardLicense -StandardName 'DefaultSharingLink' -TenantFilter $Tenant -RequiredCapabilities @('SHAREPOINTWAC', 'SHAREPOINTSTANDARD', 'SHAREPOINTENTERPRISE', 'SHAREPOINTENTERPRISE_EDU','ONEDRIVE_BASIC', 'ONEDRIVE_ENTERPRISE')
 
     # Determine the desired sharing link type (default to Internal if not specified)
 
@@ -48,8 +48,15 @@ function Invoke-CIPPStandardDefaultSharingLink {
     }
     $DesiredSharingLinkTypeValue = $SharingLinkTypeMap[$DesiredSharingLinkType]
 
-    $CurrentState = Get-CIPPSPOTenant -TenantFilter $Tenant |
-    Select-Object -Property _ObjectIdentity_, TenantFilter, DefaultSharingLinkType, DefaultLinkPermission
+    try {
+        $CurrentState = Get-CIPPSPOTenant -TenantFilter $Tenant |
+        Select-Object -Property _ObjectIdentity_, TenantFilter, DefaultSharingLinkType, DefaultLinkPermission
+    }
+    catch {
+        $ErrorMessage = Get-NormalizedError -Message $_.Exception.Message
+        Write-LogMessage -API 'Standards' -Tenant $Tenant -Message "Could not get the DefaultSharingLink state for $Tenant. Error: $ErrorMessage" -Sev Error
+        return
+    }
 
     # Check if the current state matches the desired configuration
     $StateIsCorrect = ($CurrentState.DefaultSharingLinkType -eq $DesiredSharingLinkTypeValue) -and ($CurrentState.DefaultLinkPermission -eq 1)

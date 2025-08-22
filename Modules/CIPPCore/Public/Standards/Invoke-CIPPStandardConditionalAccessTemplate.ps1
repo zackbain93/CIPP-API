@@ -30,20 +30,39 @@ function Invoke-CIPPStandardConditionalAccessTemplate {
     #>
     param($Tenant, $Settings)
     ##$Rerun -Type Standard -Tenant $Tenant -Settings $Settings 'ConditionalAccess'
-    $TestResult = Test-CIPPStandardLicense -StandardName 'ConditionalAccessTemplate' -TenantFilter $Tenant -RequiredCapabilities @('AAD_PREMIUM', 'AAD_PREMIUM_P2')
     $Table = Get-CippTable -tablename 'templates'
-
+    $TestResult = Test-CIPPStandardLicense -StandardName 'ConditionalAccessTemplate_general' -TenantFilter $Tenant -RequiredCapabilities @('AAD_PREMIUM', 'AAD_PREMIUM_P2')
+    $TestP2 = Test-CIPPStandardLicense -StandardName 'ConditionalAccessTemplate_p2' -TenantFilter $Tenant -RequiredCapabilities @('AAD_PREMIUM_P2') -SkipLog
     if ($TestResult -eq $false) {
+        #writing to each item that the license is not present.
+        $settings.TemplateList | ForEach-Object {
+            Set-CIPPStandardsCompareField -FieldName "standards.ConditionalAccessTemplate.$($_.value)" -FieldValue 'This tenant does not have the required license for this standard.' -Tenant $Tenant
+        }
         Write-Host "We're exiting as the correct license is not present for this standard."
         return $true
     } #we're done.
-    $AllCAPolicies = New-GraphGetRequest -Uri 'https://graph.microsoft.com/beta/identity/conditionalAccess/policies?$top=999' -tenantid $Tenant
+
+    try {
+        $AllCAPolicies = New-GraphGetRequest -Uri 'https://graph.microsoft.com/beta/identity/conditionalAccess/policies?$top=999' -tenantid $Tenant -asApp $true
+    } catch {
+        $ErrorMessage = Get-NormalizedError -Message $_.Exception.Message
+        Write-LogMessage -API 'Standards' -Tenant $Tenant -Message "Could not get the ConditionalAccessTemplate state for $Tenant. Error: $ErrorMessage" -Sev Error
+        return
+    }
 
     if ($Settings.remediate -eq $true) {
         foreach ($Setting in $Settings) {
             try {
                 $Filter = "PartitionKey eq 'CATemplate' and RowKey eq '$($Setting.TemplateList.value)'"
                 $JSONObj = (Get-CippAzDataTableEntity @Table -Filter $Filter).JSON
+                $Policy = $JSONObj | ConvertFrom-Json
+                if ($Policy.conditions.userRiskLevels.count -gt 0 -or $Policy.conditions.signInRiskLevels.count -gt 0) {
+                    if (!$TestP2) {
+                        Write-Information "Skipping policy $($Policy.displayName) as it requires AAD Premium P2 license."
+                        Set-CIPPStandardsCompareField -FieldName "standards.ConditionalAccessTemplate.$($Setting.value)" -FieldValue "Policy $($Policy.displayName) requires AAD Premium P2 license." -Tenant $Tenant
+                        continue
+                    }
+                }
                 $null = New-CIPPCAPolicy -replacePattern 'displayName' -TenantFilter $tenant -state $Setting.state -RawJSON $JSONObj -Overwrite $true -APIName $APIName -Headers $Request.Headers -DisableSD $Setting.DisableSD
             } catch {
                 $ErrorMessage = Get-NormalizedError -Message $_.Exception.Message
@@ -59,7 +78,15 @@ function Invoke-CIPPStandardConditionalAccessTemplate {
             $policy = $Policies | Where-Object { $_.displayName -eq $Setting.label }
             $CheckExististing = $AllCAPolicies | Where-Object -Property displayName -EQ $Setting.label
             if (!$CheckExististing) {
-                Set-CIPPStandardsCompareField -FieldName "standards.ConditionalAccessTemplate.$($Setting.value)" -FieldValue "Policy $($Setting.label) is missing from this tenant." -Tenant $Tenant
+                if ($Setting.conditions.userRiskLevels.Count -gt 0 -or $Setting.conditions.signInRiskLevels.Count -gt 0) {
+                    if (!$TestP2) {
+                        Set-CIPPStandardsCompareField -FieldName "standards.ConditionalAccessTemplate.$($Setting.value)" -FieldValue "Policy $($Setting.label) requires AAD Premium P2 license." -Tenant $Tenant
+                    } else {
+                        Set-CIPPStandardsCompareField -FieldName "standards.ConditionalAccessTemplate.$($Setting.value)" -FieldValue "Policy $($Setting.label) is missing from this tenant." -Tenant $Tenant
+                    }
+                } else {
+                    Set-CIPPStandardsCompareField -FieldName "standards.ConditionalAccessTemplate.$($Setting.value)" -FieldValue "Policy $($Setting.label) is missing from this tenant." -Tenant $Tenant
+                }
             } else {
                 $CompareObj = ConvertFrom-Json -ErrorAction SilentlyContinue -InputObject (New-CIPPCATemplate -TenantFilter $tenant -JSON $CheckExististing)
                 $Compare = Compare-CIPPIntuneObject -ReferenceObject $policy -DifferenceObject $CompareObj

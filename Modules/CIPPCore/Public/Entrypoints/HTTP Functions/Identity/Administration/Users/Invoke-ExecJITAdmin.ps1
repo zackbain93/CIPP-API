@@ -70,11 +70,12 @@ function Invoke-ExecJITAdmin {
 
             $QueueReference = '{0}-{1}' -f $Request.Query.TenantFilter, $PartitionKey # $TenantFilter is 'AllTenants'
             Write-Information "QueueReference: $QueueReference"
-            $RunningQueue = Invoke-ListCippQueue | Where-Object { $_.Reference -eq $QueueReference -and $_.Status -notmatch 'Completed' -and $_.Status -notmatch 'Failed' }
+            $RunningQueue = Invoke-ListCippQueue -Reference $QueueReference | Where-Object { $_.Status -notmatch 'Completed' -and $_.Status -notmatch 'Failed' }
 
             if ($RunningQueue) {
                 $Metadata = [PSCustomObject]@{
                     QueueMessage = 'Still loading JIT Admin data for all tenants. Please check back in a few more minutes.'
+                    QueueId      = $RunningQueue.RowKey
                 }
             } elseif (!$Rows -and !$RunningQueue) {
                 $TenantList = Get-Tenants -IncludeErrors
@@ -82,6 +83,7 @@ function Invoke-ExecJITAdmin {
 
                 $Metadata = [PSCustomObject]@{
                     QueueMessage = 'Loading JIT Admin data for all tenants. Please check back in a few minutes.'
+                    QueueId      = $Queue.RowKey
                 }
                 $InputObject = [PSCustomObject]@{
                     OrchestratorName = 'JITAdminOrchestrator'
@@ -97,6 +99,9 @@ function Invoke-ExecJITAdmin {
                 }
                 Start-NewOrchestration -FunctionName 'CIPPOrchestrator' -InputObject ($InputObject | ConvertTo-Json -Depth 5 -Compress)
             } else {
+                $Metadata = [PSCustomObject]@{
+                    QueueId = $RunningQueue.RowKey ?? $null
+                }
                 # There is data in the cache, so we will use that
                 Write-Information "Found $($Rows.Count) rows in the cache"
                 foreach ($row in $Rows) {
@@ -134,19 +139,21 @@ function Invoke-ExecJITAdmin {
         if ($Request.Body.useraction -eq 'Create') {
             Write-LogMessage -Headers $User -API $APIName -tenant $TenantFilter -message "Creating JIT Admin user $($Request.Body.Username)" -Sev 'Info'
             Write-Information "Creating JIT Admin user $($Request.Body.username)"
+            $Domain = $Request.Body.Domain.value ? $Request.Body.Domain.value : $Request.Body.Domain
+
             $JITAdmin = @{
                 User         = @{
                     'FirstName'         = $Request.Body.FirstName
                     'LastName'          = $Request.Body.LastName
-                    'UserPrincipalName' = "$($Request.Body.Username)@$($Request.Body.Domain.value)"
+                    'UserPrincipalName' = "$($Request.Body.Username)@$($Domain)"
                 }
                 Expiration   = $Expiration
                 Action       = 'Create'
                 TenantFilter = $TenantFilter
             }
             $CreateResult = Set-CIPPUserJITAdmin @JITAdmin
-            $Username = "$($Request.Body.Username)@$($Request.Body.Domain.value)"
-            $Results.Add("Created User: $($Request.Body.Username)@$($Request.Body.Domain.value)")
+            $Username = "$($Request.Body.Username)@$($Domain)"
+            $Results.Add("Created User: $Username")
             if (!$Request.Body.UseTAP) {
                 $Results.Add("Password: $($CreateResult.password)")
             }
