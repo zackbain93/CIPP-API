@@ -1,0 +1,93 @@
+{
+  "name": "TAP",
+  "label": "Enable Temporary Access Passes (TAP)",
+  "cat": "Entra (AAD) Standards",
+  "tag": [],
+  "impact": "Low Impact",
+  "helpText": "Enables TAP and sets the default TAP lifetime to 1 hour. This configuration also allows you to select if a TAP is single use or multi-logon.",
+  "executiveText": "Enables temporary access passes that IT administrators can generate for employees who are locked out or need emergency access to systems. These time-limited passs provide a secure way to restore access without compromising long-term security policies.",
+  "docsDescription": "Enables Temporary Access Pass generation for the tenant.",
+  "impactColour": "info",
+  "addedDate": "2022-03-15",
+  "powershellEquivalent": "Update-MgBetaPolicyAuthenticationMethodPolicyAuthenticationMethodConfiguration",
+  "appliesToTest": [
+    "EIDSCAAT01",
+    "EIDSCAAT02",
+    "ZTNA21845",
+    "ZTNA21846"
+  ],
+  "recommendedBy": [
+    "CIPP"
+  ],
+  "requiredCapabilities": [],
+  "secureScoreImpact": 0,
+  "compare": "subset",
+  "variables": {
+    "isUsableOnce": {
+      "type": "switch",
+      "label": "TAP is usable only once (off allows multiple logons)",
+      "default": true,
+      "recommended": true
+    },
+    "MinimumLifetime": {
+      "type": "number",
+      "label": "Minimum Lifetime (minutes)",
+      "default": 60,
+      "recommended": 60
+    },
+    "MaximumLifetime": {
+      "type": "number",
+      "label": "Maximum Lifetime (minutes)",
+      "default": 480,
+      "recommended": 480
+    },
+    "DefaultLifetime": {
+      "type": "number",
+      "label": "Default Lifetime (minutes)",
+      "default": 60,
+      "recommended": 60
+    },
+    "TAPLength": {
+      "type": "number",
+      "label": "Length (characters)",
+      "default": 8,
+      "recommended": 8
+    }
+  },
+  "expected": {
+    "state": "enabled",
+    "isUsableOnce": "%isUsableOnce%",
+    "minimumLifetimeInMinutes": "%MinimumLifetime%",
+    "maximumLifetimeInMinutes": "%MaximumLifetime%",
+    "defaultLifetimeInMinutes": "%DefaultLifetime%",
+    "defaultLength": "%TAPLength%"
+  },
+  "read": {
+    "cacheType": "AuthenticationMethodsPolicy",
+    "array": "authenticationMethodConfigurations",
+    "filter": [
+      {
+        "property": "id",
+        "value": "TemporaryAccessPass"
+      }
+    ]
+  },
+  "remediate": {
+    "executor": "GraphRequest",
+    "requests": [
+      {
+        "method": "PATCH",
+        "uri": "policies/authenticationMethodsPolicy/authenticationMethodConfigurations/TemporaryAccessPass",
+        "body": {
+          "@odata.type": "#microsoft.graph.temporaryAccessPassAuthenticationMethodConfiguration",
+          "state": "enabled",
+          "isUsableOnce": "%isUsableOnce%",
+          "minimumLifetimeInMinutes": "%MinimumLifetime%",
+          "maximumLifetimeInMinutes": "%MaximumLifetime%",
+          "defaultLifetimeInMinutes": "%DefaultLifetime%",
+          "defaultLength": "%TAPLength%"
+        }
+      }
+    ]
+  }
+}

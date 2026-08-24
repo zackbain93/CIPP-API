@@ -4,17 +4,19 @@ function Invoke-ListMailboxForwarding {
         Entrypoint
     .ROLE
         Exchange.Mailbox.Read
+    .DESCRIPTION
+        Lists mailbox forwarding rules and configurations for a tenant. Supports UseReportDB=true query parameter to retrieve cached data from the reporting database for significantly better performance, especially when querying AllTenants.
     #>
     [CmdletBinding()]
     param($Request, $TriggerMetadata)
 
     $APIName = $Request.Params.CIPPEndpoint
     $TenantFilter = $Request.Query.tenantFilter
-    $UseReportDB = $Request.Query.UseReportDB
-
+    # Serve from the reporting database cache instead of live Graph. Much faster, especially for AllTenants.
+    $UseReportDB = $Request.Query.UseReportDB -eq $true
     try {
         # If UseReportDB is specified, retrieve from report database
-        if ($UseReportDB -eq 'true') {
+        if ($UseReportDB) {
             try {
                 $GraphRequest = Get-CIPPMailboxForwardingReport -TenantFilter $TenantFilter
                 $StatusCode = [HttpStatusCode]::OK

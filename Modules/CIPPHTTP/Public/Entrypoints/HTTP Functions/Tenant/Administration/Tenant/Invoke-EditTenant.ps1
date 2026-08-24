@@ -20,6 +20,14 @@ function Invoke-EditTenant {
     $PropertiesTable = Get-CippTable -TableName 'TenantProperties'
     $Existing = Get-CIPPAzDataTableEntity @PropertiesTable -Filter "PartitionKey eq '$customerId'"
     $Tenant = Get-Tenants -TenantFilter $customerId
+    # AnyTenant: Get-Tenants is narrowed to the caller's allowed tenants; no match means
+    # unknown or out-of-scope, either way nothing may be written
+    if (-not $Tenant) {
+        return ([HttpResponseContext]@{
+                StatusCode = [HttpStatusCode]::Forbidden
+                Body       = @{ Results = "Tenant '$customerId' not found or access denied" }
+            })
+    }
     $TenantTable = Get-CippTable -TableName 'Tenants'
     $GroupMembersTable = Get-CippTable -TableName 'TenantGroupMembers'
 
@@ -28,7 +36,7 @@ function Invoke-EditTenant {
         if (!$tenantAlias) {
             if ($AliasEntity) {
                 Write-Host 'Removing alias'
-                Remove-AzDataTableEntity @PropertiesTable -Entity $AliasEntity
+                Remove-CIPPAzDataTableEntity @PropertiesTable -Entity $AliasEntity
                 $null = Get-Tenants -TenantFilter $customerId -TriggerRefresh
             }
         } else {
@@ -70,7 +78,7 @@ function Invoke-EditTenant {
             foreach ($Group in $CurrentGroupMemberships) {
                 if ($StaticGroupIds -contains $Group.GroupId -and $tenantGroups.GroupId -notcontains $Group.GroupId) {
                     $GroupName = ($StaticGroups | Where-Object { $_.RowKey -eq $Group.GroupId }).Name
-                    Remove-AzDataTableEntity @GroupMembersTable -Entity $Group
+                    Remove-CIPPAzDataTableEntity @GroupMembersTable -Entity $Group
                     Write-LogMessage -headers $Headers -API $APINAME -tenant $Tenant.defaultDomainName -TenantId $Tenant.customerId -message "Removed tenant from group '$GroupName'" -Sev 'Info'
                 }
             }
@@ -87,7 +95,7 @@ function Invoke-EditTenant {
                         customerId   = $Tenant.customerId
                     }
                     Add-CIPPAzDataTableEntity @GroupMembersTable -Entity $NewEntry -Force
-                    Remove-AzDataTableEntity @GroupMembersTable -Entity $Entry
+                    Remove-CIPPAzDataTableEntity @GroupMembersTable -Entity $Entry
                 } catch {
                     Write-Host "Error migrating entry: $($_.Exception.Message)"
                 }

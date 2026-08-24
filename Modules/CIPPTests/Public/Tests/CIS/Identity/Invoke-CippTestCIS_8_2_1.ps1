@@ -1,7 +1,7 @@
 function Invoke-CippTestCIS_8_2_1 {
     <#
     .SYNOPSIS
-    Tests CIS M365 6.0.1 (8.2.1) - External domains SHALL be restricted in the Teams admin center
+    Tests CIS M365 7.0.0 (8.2.1) - External domains SHALL be restricted in the Teams admin center
     #>
     param($Tenant)
 
@@ -19,7 +19,7 @@ function Invoke-CippTestCIS_8_2_1 {
 
         $PolicyDisabled = $E.EnableFederationAccess -eq $false
         $TenantDisabled = $F.AllowFederatedUsers -eq $false
-        $TenantAllowList = $F.AllowedDomains -and ($F.AllowedDomains.AllowedDomain -or ($F.AllowedDomains -is [array] -and $F.AllowedDomains.Count -gt 0))
+        $TenantAllowList = $F.AllowedDomains -and ($F.AllowedDomains.AllowList -or $F.AllowedDomains.AllowedDomain -or ($F.AllowedDomains -is [array] -and $F.AllowedDomains.Count -gt 0))
 
         if ($PolicyDisabled -or $TenantDisabled -or $TenantAllowList) {
             $Status = 'Passed'

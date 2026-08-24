@@ -4,6 +4,8 @@ function Invoke-ExecBackendURLs {
         Entrypoint
     .ROLE
         CIPP.AppSettings.Read
+    .DESCRIPTION
+        Returns Azure portal deep links for the CIPP deployment's own infrastructure (resource group, key vault, function app, static web app) plus its subscription, SKU, hosting mode and timezone.
     #>
     [CmdletBinding()]
     param($Request, $TriggerMetadata)
@@ -13,16 +15,11 @@ function Invoke-ExecBackendURLs {
     # Write to the Azure Functions log stream.
     Write-Host 'PowerShell HTTP trigger function processed a request.'
 
-    if ($env:WEBSITE_RESOURCE_GROUP) {
-        $RGName = $env:WEBSITE_RESOURCE_GROUP
-    } else {
-        $Owner = $env:WEBSITE_OWNER_NAME
-        if ($env:WEBSITE_SKU -ne 'FlexConsumption' -and $Owner -match '^(?<SubscriptionId>[^+]+)\+(?<RGName>[^-]+(?:-[^-]+)*?)(?:-[^-]+webspace(?:-Linux)?)?$') {
-            $RGName = $Matches.RGName
-        } else {
-            Write-Information "Could not determine resource group from environment variables. Owner: $Owner"
-            $RGName = $null
-        }
+    try {
+        $RGName = Get-CIPPFunctionAppResourceGroup
+    } catch {
+        Write-Information "Could not determine resource group: $($_.Exception.Message)"
+        $RGName = $null
     }
 
     $results = @{

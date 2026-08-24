@@ -4,6 +4,8 @@ Function Invoke-ListBasicAuth {
         Entrypoint
     .ROLE
         Identity.AuditLog.Read
+    .DESCRIPTION
+        Lists sign-in events using basic authentication (legacy protocols) for a tenant from the audit logs.
     #>
     [CmdletBinding()]
     param($Request, $TriggerMetadata)
@@ -69,7 +71,7 @@ Function Invoke-ListBasicAuth {
                     Body       = @($GraphRequest)
                 })
         } else {
-            $GraphRequest = $Rows
+            $GraphRequest = @($Rows | Select-CippAllowedTenantData -TenantProperty 'Tenant')
             return ([HttpResponseContext]@{
                     StatusCode = [HttpStatusCode]::OK
                     Body       = @($GraphRequest)

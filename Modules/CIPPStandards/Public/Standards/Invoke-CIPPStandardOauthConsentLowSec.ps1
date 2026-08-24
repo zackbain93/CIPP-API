@@ -7,8 +7,8 @@ function Invoke-CIPPStandardOauthConsentLowSec {
     .SYNOPSIS
         (Label) Allow users to consent to applications with low security risk (Prevent OAuth phishing. Lower impact, less secure)
     .DESCRIPTION
-        (Helptext) Sets the default oauth consent level so users can consent to applications that have low risks.
-        (DocsDescription) Allows users to consent to applications with low assigned risk.
+        (Helptext) Sets the default oauth consent level so users can consent to applications that have low risks. This standard conflicts with the "Require admin consent for applications" standard; only one of the two should be assigned per tenant.
+        (DocsDescription) Allows users to consent to applications with low assigned risk. This standard conflicts with the "Require admin consent for applications (Prevent OAuth phishing)" (OauthConsent) standard. Enabling both on the same tenant causes a remediation conflict, so only assign one.
     .NOTES
         CAT
             Entra (AAD) Standards
@@ -26,7 +26,7 @@ function Invoke-CIPPStandardOauthConsentLowSec {
         UPDATECOMMENTBLOCK
             Run the Tools\Update-StandardsComments.ps1 script to update this comment block
     .LINK
-        https://docs.cipp.app/user-documentation/tenant/standards/list-standards
+        https://docs.cipp.app/user-documentation/tenant/standards/alignment/templates/available-standards
     #>
 
     param($Tenant, $Settings)

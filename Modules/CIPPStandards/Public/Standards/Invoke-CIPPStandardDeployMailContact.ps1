@@ -37,11 +37,11 @@ function Invoke-CIPPStandardDeployMailContact {
         UPDATECOMMENTBLOCK
             Run the Tools\Update-StandardsComments.ps1 script to update this comment block
     .LINK
-        https://docs.cipp.app/user-documentation/tenant/standards/list-standards
+        https://docs.cipp.app/user-documentation/tenant/standards/alignment/templates/available-standards
     #>
 
     param($Tenant, $Settings)
-    $TestResult = Test-CIPPStandardLicense -StandardName 'DeployMailContact' -TenantFilter $Tenant -RequiredCapabilities @('EXCHANGE_S_STANDARD', 'EXCHANGE_S_ENTERPRISE', 'EXCHANGE_S_STANDARD_GOV', 'EXCHANGE_S_ENTERPRISE_GOV', 'EXCHANGE_LITE') #No Foundation because that does not allow powershell access
+    $TestResult = Test-CIPPStandardLicense -StandardName 'DeployMailContact' -TenantFilter $Tenant -Preset Exchange #No Foundation because that does not allow powershell access
 
     if ($TestResult -eq $false) {
         return $true
@@ -120,15 +120,18 @@ function Invoke-CIPPStandardDeployMailContact {
 
     # Report
     if ($Settings.report -eq $true) {
+        # Email addresses are compared lowercased on both sides: Exchange re-cases the domain part
+        # when it creates the contact (support@mydomain.com becomes support@Mydomain.com), which
+        # would otherwise fail the case-sensitive comparison forever.
         $ContactData = @{
             DisplayName          = $Settings.DisplayName
-            ExternalEmailAddress = $Settings.ExternalEmailAddress
+            ExternalEmailAddress = ([string]$Settings.ExternalEmailAddress).ToLower()
             FirstName            = $Settings.FirstName ?? ''
             LastName             = $Settings.LastName ?? ''
         }
         $currentValue = @{
             DisplayName          = $ExistingContactLookup.displayName
-            ExternalEmailAddress = ($ExistingContact.ExternalEmailAddress -replace 'SMTP:', '')
+            ExternalEmailAddress = ([string]($ExistingContact.ExternalEmailAddress -replace 'SMTP:', '')).ToLower()
             FirstName            = $ExistingContactLookup.givenName ?? ''
             LastName             = $ExistingContactLookup.surname ?? ''
         }

@@ -52,8 +52,11 @@ function Invoke-AddGroupTemplate {
             membershipRules = $MembershipRules
             allowExternal   = $Request.Body.allowExternal
             username        = $Request.Body.username  # Can contain variables like @%tenantfilter%
+            licenses        = $Request.Body.licenses
+            aliases         = $Request.Body.aliases # One per line, variables allowed
+            hideFromGAL     = $Request.Body.hideFromGAL
             GUID            = $GUID
-        } | ConvertTo-Json
+        } | ConvertTo-Json -Depth 10
         $Table = Get-CippTable -tablename 'templates'
         $Table.Force = $true
         Add-CIPPAzDataTableEntity @Table -Force -Entity @{

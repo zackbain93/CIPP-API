@@ -19,6 +19,16 @@ function Start-TableCleanup {
         @{
             FunctionName   = 'TableCleanupTask'
             Type           = 'CleanupRule'
+            TableName      = 'CippReportingDB'
+            DataTableProps = @{
+                Filter   = "Timestamp lt datetime'$((Get-Date).AddDays(-30).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'))'"
+                First    = 10000
+                Property = @('PartitionKey', 'RowKey', 'ETag')
+            }
+        }
+        @{
+            FunctionName   = 'TableCleanupTask'
+            Type           = 'CleanupRule'
             TableName      = 'AuditLogSearches'
             DataTableProps = @{
                 Filter   = "PartitionKey eq 'Search' and Timestamp lt datetime'$((Get-Date).AddHours(-12).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'))'"
@@ -91,6 +101,29 @@ function Start-TableCleanup {
             TableName      = 'CippOrchestratorBatch'
             DataTableProps = @{
                 Filter   = "Timestamp lt datetime'$((Get-Date).AddHours(-24).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'))'"
+                First    = 10000
+                Property = @('PartitionKey', 'RowKey', 'ETag')
+            }
+        }
+        @{
+            FunctionName   = 'TableCleanupTask'
+            Type           = 'CleanupRule'
+            TableName      = 'knownlocationdbv2'
+            DataTableProps = @{
+                Filter   = "PartitionKey eq 'ip' and Timestamp lt datetime'$((Get-Date).AddDays(-90).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'))'"
+                First    = 10000
+                Property = @('PartitionKey', 'RowKey', 'ETag')
+            }
+        }
+        @{
+            # Baseline run/audit history: 90-day rolling retention. Active tenant-standard
+            # pairs rewrite rows every 12h run, so recent history always survives; pairs
+            # that stopped resolving age out entirely with their rows.
+            FunctionName   = 'TableCleanupTask'
+            Type           = 'CleanupRule'
+            TableName      = 'BaselineHistory'
+            DataTableProps = @{
+                Filter   = "Timestamp lt datetime'$((Get-Date).AddDays(-90).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'))'"
                 First    = 10000
                 Property = @('PartitionKey', 'RowKey', 'ETag')
             }

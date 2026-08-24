@@ -4,7 +4,7 @@ function Set-CIPPDBCacheCsTeamsMessagingPolicy {
         Caches the Teams Messaging Policy (Global)
 
     .DESCRIPTION
-        Calls Get-CsTeamsMessagingPolicy via New-TeamsRequest and writes the
+        Calls Get-CsTeamsMessagingPolicy via New-TeamsRequestV2 and writes the
         result into the CippReportingDB under Type 'CsTeamsMessagingPolicy'.
         Used by CIS tests 8.2.3 (external Teams users initiating chat) and
         8.6.1 (security reporting in Teams).
@@ -25,12 +25,11 @@ function Set-CIPPDBCacheCsTeamsMessagingPolicy {
     try {
         Write-LogMessage -API 'CIPPDBCache' -tenant $TenantFilter -message 'Caching Teams Messaging Policy' -sev Debug
 
-        $MessagingPolicy = New-TeamsRequest -TenantFilter $TenantFilter -Cmdlet 'Get-CsTeamsMessagingPolicy' -CmdParams @{ Identity = 'Global' }
+        $MessagingPolicy = New-TeamsRequestV2 -TenantFilter $TenantFilter -Type 'TeamsMessagingPolicy' -Action Get -Identity 'Global'
 
         if ($MessagingPolicy) {
             $Data = @($MessagingPolicy)
-            Add-CIPPDbItem -TenantFilter $TenantFilter -Type 'CsTeamsMessagingPolicy' -Data $Data
-            Add-CIPPDbItem -TenantFilter $TenantFilter -Type 'CsTeamsMessagingPolicy' -Data $Data -Count
+            Add-CIPPDbItem -TenantFilter $TenantFilter -Type 'CsTeamsMessagingPolicy' -Data $Data -AddCount
             Write-LogMessage -API 'CIPPDBCache' -tenant $TenantFilter -message 'Cached Teams Messaging Policy' -sev Debug
         }
         $MessagingPolicy = $null

@@ -80,6 +80,16 @@ function Get-CIPPTenantAlignment {
                 $TemplatesByPackage[$t.Package].Add($t)
             }
         }
+        $CATagTemplates = Get-CIPPAzDataTableEntity @TemplateTable -Filter "PartitionKey eq 'CATemplate'"
+        $CATemplatesByPackage = @{}
+        foreach ($t in $CATagTemplates) {
+            if ($t.Package) {
+                if (-not $CATemplatesByPackage.ContainsKey($t.Package)) {
+                    $CATemplatesByPackage[$t.Package] = [System.Collections.Generic.List[object]]::new()
+                }
+                $CATemplatesByPackage[$t.Package].Add($t)
+            }
+        }
         # Build tenant standards data structure
         $tenantData = @{}
         foreach ($Standard in $Standards) {
@@ -98,7 +108,8 @@ function Get-CIPPTenantAlignment {
                 }
             }
 
-            if ($Tenant -and -not $tenantData.ContainsKey($Tenant)) {
+            if (-not $Tenant) { continue }
+            if (-not $tenantData.ContainsKey($Tenant)) {
                 $tenantData[$Tenant] = @{}
             }
             $tenantData[$Tenant][$FieldName] = @{
@@ -214,9 +225,13 @@ function Get-CIPPTenantAlignment {
                             foreach ($Tag in $IntuneTemplate.'TemplateList-Tags') {
                                 $IntuneActions = if ($IntuneTemplate.action) { $IntuneTemplate.action } else { @() }
                                 $IntuneReportingEnabled = ($IntuneActions | Where-Object { $_.value -and ($_.value.ToLower() -eq 'report' -or $_.value.ToLower() -eq 'remediate') }).Count -gt 0
-                                $TagTemplate = if ($TemplatesByPackage.ContainsKey($Tag.value)) { $TemplatesByPackage[$Tag.value] } else { @() }
+                                $TagValue = if ($Tag.value) { $Tag.value } else { $Tag }
+                                $TagTemplate = if ($TagValue -and $TemplatesByPackage.ContainsKey($TagValue)) { $TemplatesByPackage[$TagValue] } else { @() }
                                 $TagTemplate | ForEach-Object {
-                                    $TagStandardId = "standards.IntuneTemplate.$($_.GUID)"
+                                    # RowKey, not the GUID column: the standards engine deploys tag members with
+                                    # TemplateList.value = RowKey and writes the compare row under that id, so the
+                                    # expected id must match it. The GUID column can be missing or stale.
+                                    $TagStandardId = "standards.IntuneTemplate.$($_.RowKey)"
                                     [PSCustomObject]@{
                                         StandardId       = $TagStandardId
                                         ReportingEnabled = $IntuneReportingEnabled
@@ -237,6 +252,40 @@ function Get-CIPPTenantAlignment {
                             [PSCustomObject]@{
                                 StandardId       = $CAStandardId
                                 ReportingEnabled = $CAReportingEnabled
+                            }
+                        }
+
+                        if ($CATemplate.'TemplateList-Tags') {
+                            foreach ($Tag in $CATemplate.'TemplateList-Tags') {
+                                Write-Host "Processing CA Tag: $($Tag.value)"
+                                $CAActions = if ($CATemplate.action) { $CATemplate.action } else { @() }
+                                $CAReportingEnabled = ($CAActions | Where-Object { $_.value -and ($_.value.ToLower() -eq 'report' -or $_.value.ToLower() -eq 'remediate') }).Count -gt 0
+                                $TagValue = if ($Tag.value) { $Tag.value } else { $Tag }
+                                $TagTemplate = if ($CATemplatesByPackage.ContainsKey($TagValue)) { $CATemplatesByPackage[$TagValue] } else { @() }
+                                $TagTemplate | ForEach-Object {
+                                    # RowKey, not the GUID column - must match the id the standards engine
+                                    # deploys with and writes the compare row under (see Intune block above)
+                                    $TagStandardId = "standards.ConditionalAccessTemplate.$($_.RowKey)"
+                                    [PSCustomObject]@{
+                                        StandardId       = $TagStandardId
+                                        ReportingEnabled = $CAReportingEnabled
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                # Handle Reusable Settings templates — TemplateList is multi-select, one key per template id
+                elseif ($StandardKey -eq 'ReusableSettingsTemplate' -and $StandardConfig) {
+                    foreach ($RSTemplate in @($StandardConfig)) {
+                        $RSActions = if ($RSTemplate.action) { $RSTemplate.action } else { @() }
+                        $RSReportingEnabled = ($RSActions | Where-Object { $_.value -and ($_.value.ToLower() -eq 'report' -or $_.value.ToLower() -eq 'remediate') }).Count -gt 0
+                        foreach ($RSTemplateId in @($RSTemplate.TemplateList.value)) {
+                            if ($RSTemplateId) {
+                                [PSCustomObject]@{
+                                    StandardId       = "standards.ReusableSettingsTemplate.$RSTemplateId"
+                                    ReportingEnabled = $RSReportingEnabled
+                                }
                             }
                         }
                     }
@@ -262,8 +311,10 @@ function Get-CIPPTenantAlignment {
                 }
             }
 
-            $AllStandards = $StandardsData.StandardId
-            $AllStandardsArray = @($AllStandards)
+            if (-not $StandardsData) { continue }
+            $AllStandards = @($StandardsData.StandardId | Where-Object { $_ })
+            if ($AllStandards.Count -eq 0) { continue }
+            $AllStandardsArray = $AllStandards
             $ReportingDisabledStandards = ($StandardsData | Where-Object { -not $_.ReportingEnabled }).StandardId
             $ReportingDisabledSet = [System.Collections.Generic.HashSet[string]]::new()
             foreach ($item in $ReportingDisabledStandards) { [void]$ReportingDisabledSet.Add($item) }
@@ -422,8 +473,7 @@ function Get-CIPPTenantAlignment {
                                 $DeniedDeviationsCount++
                             }
                         }
-                    }
-                    elseif ($item.ComplianceStatus -eq 'License Missing') { $LicenseMissingStandards++ }
+                    } elseif ($item.ComplianceStatus -eq 'License Missing') { $LicenseMissingStandards++ }
                     if ($item.ReportingDisabled) { $ReportingDisabledStandardsCount++ }
                 }
 

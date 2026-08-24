@@ -4,6 +4,8 @@ function Invoke-ListJITAdminTemplates {
         Entrypoint,AnyTenant
     .ROLE
         Identity.Role.Read
+    .DESCRIPTION
+        Lists Just-in-Time admin role templates that define temporary admin role assignments.
     #>
     [CmdletBinding()]
     param($Request, $TriggerMetadata)
@@ -15,7 +17,7 @@ function Invoke-ListJITAdminTemplates {
     $TenantFilter = $Request.Query.TenantFilter
 
     # Get the includeAllTenants flag from query or body parameters (defaults to true)
-    $IncludeAllTenants = if ($Request.Query.includeAllTenants -eq 'false' -or $Request.Body.includeAllTenants -eq 'false') {
+    $IncludeAllTenants = if ($Request.Query.includeAllTenants -eq $false -or $Request.Body.includeAllTenants -eq $false) {
         $false
     } else {
         $true

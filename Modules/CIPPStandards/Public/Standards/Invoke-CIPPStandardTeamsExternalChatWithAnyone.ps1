@@ -34,18 +34,18 @@ function Invoke-CIPPStandardTeamsExternalChatWithAnyone {
         UPDATECOMMENTBLOCK
             Run the Tools\Update-StandardsComments.ps1 script to update this comment block
     .LINK
-        https://docs.cipp.app/user-documentation/tenant/standards/list-standards
+        https://docs.cipp.app/user-documentation/tenant/standards/alignment/templates/available-standards
     #>
 
     param($Tenant, $Settings)
-    $TestResult = Test-CIPPStandardLicense -StandardName 'TeamsExternalChatWithAnyone' -TenantFilter $Tenant -RequiredCapabilities @('MCOSTANDARD', 'MCOEV', 'MCOIMP', 'TEAMS1', 'Teams_Room_Standard')
+    $TestResult = Test-CIPPStandardLicense -StandardName 'TeamsExternalChatWithAnyone' -TenantFilter $Tenant -Preset Teams
 
     if ($TestResult -eq $false) {
         return $true
     }
 
     try {
-        $CurrentState = New-TeamsRequest -TenantFilter $Tenant -Cmdlet 'Get-CsTeamsMessagingPolicy' -CmdParams @{ Identity = 'Global' } | Select-Object -Property Identity, UseB2BInvitesToAddExternalUsers
+        $CurrentState = New-TeamsRequestV2 -TenantFilter $Tenant -Type 'TeamsMessagingPolicy' -Action Get -Identity 'Global' | Select-Object -Property Identity, UseB2BInvitesToAddExternalUsers
     } catch {
         $ErrorMessage = Get-CippException -Exception $_
         Write-LogMessage -API 'Standards' -Tenant $Tenant -Message "Could not get the Teams external chat state for $Tenant. Error: $($ErrorMessage.NormalizedError)" -Sev Error -LogData $ErrorMessage
@@ -67,7 +67,7 @@ function Invoke-CIPPStandardTeamsExternalChatWithAnyone {
             }
 
             try {
-                $null = New-TeamsRequest -TenantFilter $Tenant -Cmdlet 'Set-CsTeamsMessagingPolicy' -CmdParams $cmdParams
+                $null = New-TeamsRequestV2 -TenantFilter $Tenant -Type 'TeamsMessagingPolicy' -Action Set -Parameters $cmdParams
                 Write-LogMessage -API 'Standards' -tenant $Tenant -message "Successfully updated Teams external chat with anyone setting to UseB2BInvitesToAddExternalUsers: $DesiredState" -sev Info
             } catch {
                 $ErrorMessage = Get-CippException -Exception $_

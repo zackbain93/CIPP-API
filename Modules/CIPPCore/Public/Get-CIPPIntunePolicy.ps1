@@ -34,6 +34,17 @@ function Get-CIPPIntunePolicy {
                 $androidPolicies = ($BulkResults | Where-Object { $_.id -eq 'AndroidPolicies' }).body.value
                 $iOSPolicies = ($BulkResults | Where-Object { $_.id -eq 'iOSPolicies' }).body.value
 
+                # Reading a concrete collection makes Graph omit @odata.type from every item, but
+                # callers need the concrete type to address the policy - its assignments live under
+                # that collection. The collection a policy came from is the authoritative answer, so
+                # record it here rather than leaving each caller to infer it from the payload.
+                foreach ($Policy in $androidPolicies) {
+                    $null = $Policy | Add-Member -MemberType NoteProperty -Name '@odata.type' -Value '#microsoft.graph.androidManagedAppProtection' -Force
+                }
+                foreach ($Policy in $iOSPolicies) {
+                    $null = $Policy | Add-Member -MemberType NoteProperty -Name '@odata.type' -Value '#microsoft.graph.iosManagedAppProtection' -Force
+                }
+
                 if ($DisplayName) {
                     $androidPolicy = $androidPolicies | Where-Object -Property displayName -EQ $DisplayName | Sort-Object -Property lastModifiedDateTime -Descending | Select-Object -First 1
                     $iOSPolicy = $iOSPolicies | Where-Object -Property displayName -EQ $DisplayName | Sort-Object -Property lastModifiedDateTime -Descending | Select-Object -First 1
@@ -423,6 +434,88 @@ function Get-CIPPIntunePolicy {
                     foreach ($policy in $policies) {
                         $policyDetails = New-GraphGETRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL('$($policy.id)')" -tenantid $tenantFilter
                         $policyDetails = $policyDetails | Select-Object * -ExcludeProperty id, lastModifiedDateTime, '@odata.context', 'ScopeTagIds', 'supportsScopeTags', 'createdDateTime'
+                        $policyJson = ConvertTo-Json -InputObject $policyDetails -Depth 100 -Compress
+                        $policy | Add-Member -MemberType NoteProperty -Name 'cippconfiguration' -Value $policyJson -Force
+                    }
+                    return $policies
+                }
+            }
+            'hardwareConfigurations' {
+                $PlatformType = 'deviceManagement'
+                $TemplateTypeURL = 'hardwareConfigurations'
+
+                if ($DisplayName) {
+                    $policies = New-GraphGETRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL" -tenantid $tenantFilter
+                    $policy = $policies | Where-Object -Property displayName -EQ $DisplayName | Sort-Object -Property lastModifiedDateTime -Descending | Select-Object -First 1
+                    if ($policy) {
+                        $policyDetails = New-GraphGETRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL('$($policy.id)')" -tenantid $tenantFilter
+                        $policyDetails = $policyDetails | Select-Object * -ExcludeProperty id, lastModifiedDateTime, '@odata.context', 'ScopeTagIds', 'supportsScopeTags', 'createdDateTime'
+                        $policyJson = ConvertTo-Json -InputObject $policyDetails -Depth 100 -Compress
+                        $policy | Add-Member -MemberType NoteProperty -Name 'cippconfiguration' -Value $policyJson -Force
+                    }
+                    return $policy
+                } elseif ($PolicyId) {
+                    $policy = New-GraphGETRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL('$PolicyId')" -tenantid $tenantFilter
+                    if ($policy) {
+                        $policyDetails = $policy | Select-Object * -ExcludeProperty id, lastModifiedDateTime, '@odata.context', 'ScopeTagIds', 'supportsScopeTags', 'createdDateTime'
+                        $policyJson = ConvertTo-Json -InputObject $policyDetails -Depth 100 -Compress
+                        $policy | Add-Member -MemberType NoteProperty -Name 'cippconfiguration' -Value $policyJson -Force
+                    }
+                    return $policy
+                } else {
+                    $policies = New-GraphGETRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL" -tenantid $tenantFilter
+                    foreach ($policy in $policies) {
+                        $policyDetails = New-GraphGETRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL('$($policy.id)')" -tenantid $tenantFilter
+                        $policyDetails = $policyDetails | Select-Object * -ExcludeProperty id, lastModifiedDateTime, '@odata.context', 'ScopeTagIds', 'supportsScopeTags', 'createdDateTime'
+                        $policyJson = ConvertTo-Json -InputObject $policyDetails -Depth 100 -Compress
+                        $policy | Add-Member -MemberType NoteProperty -Name 'cippconfiguration' -Value $policyJson -Force
+                    }
+                    return $policies
+                }
+            }
+            'Intents' {
+                $PlatformType = 'deviceManagement'
+                $TemplateTypeURL = 'intents'
+
+                if ($DisplayName) {
+                    $policies = New-GraphGETRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL" -tenantid $tenantFilter
+                    $policy = $policies | Where-Object -Property displayName -EQ $DisplayName | Sort-Object -Property lastModifiedDateTime -Descending | Select-Object -First 1
+                    if ($policy) {
+                        $settings = New-GraphGETRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL('$($policy.id)')/settings" -tenantid $tenantFilter
+                        $policyDetails = [PSCustomObject]@{
+                            displayName = $policy.displayName
+                            description = $policy.description
+                            templateId  = $policy.templateId
+                            settings    = @($settings)
+                        }
+                        $policyJson = ConvertTo-Json -InputObject $policyDetails -Depth 100 -Compress
+                        $policy | Add-Member -MemberType NoteProperty -Name 'cippconfiguration' -Value $policyJson -Force
+                    }
+                    return $policy
+                } elseif ($PolicyId) {
+                    $policy = New-GraphGETRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL('$PolicyId')" -tenantid $tenantFilter
+                    if ($policy) {
+                        $settings = New-GraphGETRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL('$PolicyId')/settings" -tenantid $tenantFilter
+                        $policyDetails = [PSCustomObject]@{
+                            displayName = $policy.displayName
+                            description = $policy.description
+                            templateId  = $policy.templateId
+                            settings    = @($settings)
+                        }
+                        $policyJson = ConvertTo-Json -InputObject $policyDetails -Depth 100 -Compress
+                        $policy | Add-Member -MemberType NoteProperty -Name 'cippconfiguration' -Value $policyJson -Force
+                    }
+                    return $policy
+                } else {
+                    $policies = New-GraphGETRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL" -tenantid $tenantFilter
+                    foreach ($policy in $policies) {
+                        $settings = New-GraphGETRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL('$($policy.id)')/settings" -tenantid $tenantFilter
+                        $policyDetails = [PSCustomObject]@{
+                            displayName = $policy.displayName
+                            description = $policy.description
+                            templateId  = $policy.templateId
+                            settings    = @($settings)
+                        }
                         $policyJson = ConvertTo-Json -InputObject $policyDetails -Depth 100 -Compress
                         $policy | Add-Member -MemberType NoteProperty -Name 'cippconfiguration' -Value $policyJson -Force
                     }

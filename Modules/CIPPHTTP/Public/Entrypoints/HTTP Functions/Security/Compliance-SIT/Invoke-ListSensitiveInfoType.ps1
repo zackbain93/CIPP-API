@@ -4,11 +4,14 @@ Function Invoke-ListSensitiveInfoType {
         Entrypoint
     .ROLE
         Security.SensitiveInfoType.Read
+    .DESCRIPTION
+        Lists sensitive information types (SITs) configured in the Security & Compliance Center, optionally including built-in types.
     #>
     [CmdletBinding()]
     param($Request, $TriggerMetadata)
     $TenantFilter = $Request.Query.tenantFilter
-    $IncludeBuiltIn = ($Request.Query.IncludeBuiltIn -eq 'true' -or $Request.Query.IncludeBuiltIn -eq $true)
+    # Include Microsoft's built-in sensitive information types alongside the tenant's custom ones.
+    $IncludeBuiltIn = $Request.Query.IncludeBuiltIn -eq $true
 
     try {
         $SITs = New-ExoRequest -tenantid $TenantFilter -cmdlet 'Get-DlpSensitiveInformationType' -Compliance | Select-Object * -ExcludeProperty *odata*, *data.type*

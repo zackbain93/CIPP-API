@@ -23,6 +23,7 @@ function Get-CippKeyVaultSecret {
     Get-CippKeyVaultSecret -VaultName 'mykeyvault' -Name 'RefreshToken' -AsPlainText
     #>
     [CmdletBinding()]
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingConvertToSecureStringWithPlainText', '', Justification = 'Wraps the value returned by the Key Vault REST call in a SecureString to match the Get-AzKeyVaultSecret return shape')]
     param(
         [Parameter(Mandatory = $false)]
         [string]$VaultName,
@@ -37,10 +38,9 @@ function Get-CippKeyVaultSecret {
     try {
         # Derive vault name if not provided
         if (-not $VaultName) {
-            if ($env:WEBSITE_DEPLOYMENT_ID) {
-                $VaultName = ($env:WEBSITE_DEPLOYMENT_ID -split '-')[0]
-            } else {
-                throw 'VaultName not provided and WEBSITE_DEPLOYMENT_ID environment variable not set'
+            $VaultName = Get-CippKeyVaultName
+            if (-not $VaultName) {
+                throw 'VaultName not provided and could not be derived (WEBSITE_SITE_NAME / WEBSITE_DEPLOYMENT_ID not set)'
             }
         }
 
@@ -61,6 +61,10 @@ function Get-CippKeyVaultSecret {
                 break
             } catch {
                 $lastError = $_
+                # 404 is definitive - the secret does not exist and retrying cannot change that
+                if ($_.Exception.Message -match '404|SecretNotFound') {
+                    throw "Failed to retrieve secret '$Name' from vault '$VaultName': $($_.Exception.Message)"
+                }
                 if ($i -lt ($maxRetries - 1)) {
                     Start-Sleep -Seconds $retryDelay
                     $retryDelay *= 2  # Exponential backoff

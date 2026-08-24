@@ -138,11 +138,11 @@ function Invoke-ExecDurableFunctions {
             if ($Request.Query.PartitionKey) {
                 $HistoryEntities = Get-CIPPAzDataTableEntity @HistoryTable -Filter "PartitionKey eq '$($Request.Query.PartitionKey)'" -Property RowKey, PartitionKey
                 if ($HistoryEntities) {
-                    Remove-AzDataTableEntity -Force @HistoryTable -Entity $HistoryEntities
+                    Remove-CIPPAzDataTableEntity -Force @HistoryTable -Entity $HistoryEntities
                 }
                 $Instance = Get-CIPPAzDataTableEntity @InstancesTable -Filter "PartitionKey eq '$($Request.Query.PartitionKey)'" -Property RowKey, PartitionKey
                 if ($Instance) {
-                    Remove-AzDataTableEntity -Force @InstancesTable -Entity $Instance
+                    Remove-CIPPAzDataTableEntity -Force @InstancesTable -Entity $Instance
                 }
                 $Body = [PSCustomObject]@{
                     Results = 'Orchestrator {0} purged successfully' -f $Request.Query.PartitionKey
@@ -150,6 +150,11 @@ function Invoke-ExecDurableFunctions {
             } else {
                 Remove-AzDataTable @InstancesTable
                 Remove-AzDataTable @HistoryTable
+                # Drop these from the Get-CIPPTable cache so they get recreated on next use.
+                Unregister-CIPPTable -TableName @(
+                    ('{0}Instances' -f $FunctionName)
+                    ('{0}History' -f $FunctionName)
+                )
                 $BlobContainer = '{0}-largemessages' -f $Function.Name
                 if (Get-AzStorageContainer -Name $BlobContainer -Context $StorageContext -ErrorAction SilentlyContinue) {
                     Write-Information "- Removing blob container: $BlobContainer"

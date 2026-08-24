@@ -1,7 +1,7 @@
 function Invoke-CippTestCIS_3_2_2 {
     <#
     .SYNOPSIS
-    Tests CIS M365 6.0.1 (3.2.2) - DLP policies SHALL be enabled for Microsoft Teams
+    Tests CIS M365 7.0.0 (3.2.2) - DLP policies SHALL be enabled for Microsoft Teams
     #>
     param($Tenant)
 
@@ -17,7 +17,7 @@ function Invoke-CippTestCIS_3_2_2 {
             $_.Mode -eq 'Enable' -and $_.Enabled -eq $true -and (
                 $_.TeamsLocation -or
                 $_.Workload -match 'Teams' -or
-                $_.TeamsLocationException -ne $null
+                $_.TeamsLocationException
             )
         }
 

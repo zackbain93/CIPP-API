@@ -42,21 +42,21 @@ function Invoke-CIPPStandardPWdisplayAppInformationRequiredState {
         UPDATECOMMENTBLOCK
             Run the Tools\Update-StandardsComments.ps1 script to update this comment block
     .LINK
-        https://docs.cipp.app/user-documentation/tenant/standards/list-standards
+        https://docs.cipp.app/user-documentation/tenant/standards/alignment/templates/available-standards
     #>
 
     param($Tenant, $Settings)
 
     try {
-        $CurrentState = New-GraphGetRequest -Uri 'https://graph.microsoft.com/beta/policies/authenticationMethodsPolicy/authenticationMethodConfigurations/microsoftAuthenticator' -tenantid $Tenant
+        $CurrentState = New-GraphGetRequest -Uri 'https://graph.microsoft.com/beta/policies/authenticationMethodsPolicy/authenticationMethodConfigurations/microsoftAuthenticator' -tenantid $Tenant -AsApp $True
     } catch {
         $ErrorMessage = Get-NormalizedError -Message $_.Exception.Message
         Write-LogMessage -API 'Standards' -Tenant $Tenant -Message "Could not get the PWdisplayAppInformationRequiredState state for $Tenant. Error: $ErrorMessage" -Sev Error
         return
     }
 
+    # numberMatchingRequiredState is not graded: it is permanently enabled by Microsoft and can no longer be toggled
     $StateIsCorrect = ($CurrentState.state -eq 'enabled') -and
-    ($CurrentState.featureSettings.numberMatchingRequiredState.state -eq 'enabled') -and
     ($CurrentState.featureSettings.displayAppInformationRequiredState.state -eq 'enabled')
 
     if ($Settings.remediate -eq $true) {
@@ -64,8 +64,10 @@ function Invoke-CIPPStandardPWdisplayAppInformationRequiredState {
             Write-LogMessage -API 'Standards' -tenant $tenant -message 'Passwordless with Information and Number Matching is already enabled.' -sev Info
         } else {
             try {
-                Set-CIPPAuthenticationPolicy -Tenant $tenant -APIName 'Standards' -AuthenticationMethodId 'MicrosoftAuthenticator' -Enabled $true
+                Set-CIPPAuthenticationPolicy -Tenant $tenant -APIName 'Standards' -AuthenticationMethodId 'MicrosoftAuthenticator' -Enabled $true -MicrosoftAuthenticatorDisplayAppInfo 'enabled'
             } catch {
+                $ErrorMessage = Get-CippException -Exception $_
+                Write-LogMessage -API 'Standards' -tenant $tenant -message "Failed to enable Passwordless with Information and Number Matching. Error: $($ErrorMessage.NormalizedError)" -sev Error -LogData $ErrorMessage
             }
         }
     }
@@ -83,12 +85,10 @@ function Invoke-CIPPStandardPWdisplayAppInformationRequiredState {
         Add-CIPPBPAField -FieldName 'PWdisplayAppInformationRequiredState' -FieldValue $StateIsCorrect -StoreAs bool -Tenant $tenant
         $CurrentValue = @{
             state                              = $CurrentState.state
-            numberMatchingRequiredState        = $CurrentState.featureSettings.numberMatchingRequiredState.state
             displayAppInformationRequiredState = $CurrentState.featureSettings.displayAppInformationRequiredState.state
         }
         $ExpectedValue = @{
             state                              = 'enabled'
-            numberMatchingRequiredState        = 'enabled'
             displayAppInformationRequiredState = 'enabled'
         }
         Set-CIPPStandardsCompareField -FieldName 'standards.PWdisplayAppInformationRequiredState' -CurrentValue $CurrentValue -ExpectedValue $ExpectedValue -Tenant $tenant

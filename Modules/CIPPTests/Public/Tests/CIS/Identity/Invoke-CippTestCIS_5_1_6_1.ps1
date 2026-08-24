@@ -1,7 +1,7 @@
 function Invoke-CippTestCIS_5_1_6_1 {
     <#
     .SYNOPSIS
-    Tests CIS M365 6.0.1 (5.1.6.1) - Collaboration invitations SHALL be sent to allowed domains only
+    Tests CIS M365 7.0.0 (5.1.6.1) - Collaboration invitations SHALL be sent to allowed domains only
     #>
     param($Tenant)
 
@@ -14,20 +14,24 @@ function Invoke-CippTestCIS_5_1_6_1 {
             return
         }
 
-        # Inspect B2B management policy AllowedDomains / BlockedDomains
-        $Cfg = $B2B | Select-Object -First 1
+        # Inspect B2B management policy AllowedDomains / BlockedDomains.
+        # b2bManagementPolicy inherits from stsPolicy, so the settings live in definition[0] as a JSON string.
+        $Cfg = $B2B | Where-Object { $_.isOrganizationDefault -eq $true } | Select-Object -First 1
+        if (-not $Cfg) { $Cfg = $B2B | Select-Object -First 1 }
         if ($Cfg) {
-            $Allowed = $Cfg.allowInvitesFrom
-            $Domains = $Cfg.invitationsAllowedAndBlockedDomainsPolicy
+            $Domains = $null
+            if ($Cfg.definition) {
+                $Definition = @($Cfg.definition)[0] | ConvertFrom-Json -ErrorAction SilentlyContinue
+                $Domains = $Definition.B2BManagementPolicy.InvitationsAllowedAndBlockedDomainsPolicy
+            }
+            $AllowedDomains = @($Domains.AllowedDomains)
+            $BlockedDomains = @($Domains.BlockedDomains)
 
-            $Pass = $Domains -and (
-                ($Domains.allowedDomains -and $Domains.allowedDomains.Count -gt 0) -or
-                ($Domains.blockedDomains -and $Domains.blockedDomains.Count -gt 0)
-            )
+            $Pass = ($AllowedDomains.Count -gt 0) -or ($BlockedDomains.Count -gt 0)
 
             if ($Pass) {
                 $Status = 'Passed'
-                $Result = "B2B invitations are scoped by an allow/block list (allowed: $($Domains.allowedDomains -join ', '); blocked: $($Domains.blockedDomains -join ', '))."
+                $Result = "B2B invitations are scoped by an allow/block list (allowed: $($AllowedDomains -join ', '); blocked: $($BlockedDomains -join ', '))."
             } else {
                 $Status = 'Failed'
                 $Result = 'B2B invitations are not constrained by an allow / block list. Configure invitationsAllowedAndBlockedDomainsPolicy.'

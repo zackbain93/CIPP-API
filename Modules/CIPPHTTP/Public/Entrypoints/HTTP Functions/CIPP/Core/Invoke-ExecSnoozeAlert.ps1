@@ -3,7 +3,7 @@ function Invoke-ExecSnoozeAlert {
     .FUNCTIONALITY
         Entrypoint,AnyTenant
     .ROLE
-        CIPP.Alert.ReadWrite
+        CIPP.AlertSnooze.ReadWrite
     #>
     [CmdletBinding()]
     param($Request, $TriggerMetadata)
@@ -16,6 +16,7 @@ function Invoke-ExecSnoozeAlert {
         $TenantFilter = $Request.Body.TenantFilter
         $AlertItem = $Request.Body.AlertItem
         $Duration = [int]$Request.Body.Duration
+        $Reason = [string]$Request.Body.Reason
         $SnoozedBy = try {
             ([System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($Request.Headers.'x-ms-client-principal')) | ConvertFrom-Json).userDetails
         } catch { 'Unknown' }
@@ -31,6 +32,15 @@ function Invoke-ExecSnoozeAlert {
             return ([HttpResponseContext]@{
                     StatusCode = [HttpStatusCode]::BadRequest
                     Body       = @{ Results = 'Duration must be 7, 14, 30, or 90 days.' }
+                })
+        }
+
+        # AnyTenant: enforce tenant scope here; Get-Tenants is narrowed to the caller's allowed tenants
+        $AllowedTenants = Test-CIPPAccess -Request $Request -TenantList
+        if ($AllowedTenants -notcontains 'AllTenants' -and -not (Get-Tenants -TenantFilter $TenantFilter)) {
+            return ([HttpResponseContext]@{
+                    StatusCode = [HttpStatusCode]::Forbidden
+                    Body       = @{ Results = 'Access to this tenant is not allowed' }
                 })
         }
 
@@ -56,6 +66,7 @@ function Invoke-ExecSnoozeAlert {
             SnoozedAt      = [string]$CurrentUnixTime
             ContentPreview = [string]$HashResult.ContentPreview
             SnoozeKey      = [string]$HashResult.RawKey
+            SnoozeReason   = [string]$Reason
         }
 
         Add-CIPPAzDataTableEntity @SnoozeTable -Entity $SnoozeEntity -Force | Out-Null
@@ -63,6 +74,9 @@ function Invoke-ExecSnoozeAlert {
         $DurationLabel = if ($Duration -eq -1) { 'forever' } else { "$Duration days" }
         $ContentPreview = $HashResult.ContentPreview
         $Result = "Successfully snoozed alert for ${DurationLabel}: ${ContentPreview}"
+        if (-not [string]::IsNullOrWhiteSpace($Reason)) {
+            $Result = "$Result - Reason: $Reason"
+        }
 
         Write-LogMessage -headers $Headers -API $APIName -message $Result -Sev 'Info' -tenant $TenantFilter
 

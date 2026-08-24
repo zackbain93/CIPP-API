@@ -34,12 +34,12 @@ function Invoke-ExecCreateAppTemplate {
             [PSCustomObject]@{
                 id     = 'app'
                 method = 'GET'
-                url    = "/applications(appId='$AppId')?`$select=id,appId,displayName,requiredResourceAccess"
+                url    = "/applications(appId='$AppId')?`$select=id,appId,displayName,signInAudience,requiredResourceAccess"
             }
             [PSCustomObject]@{
                 id     = 'splist'
                 method = 'GET'
-                url    = '/servicePrincipals?$top=999&$select=id,appId,displayName'
+                url    = '/servicePrincipals?$top=999&$select=id,appId,displayName,signInAudience'
             }
         )
 
@@ -51,6 +51,20 @@ function Invoke-ExecCreateAppTemplate {
 
         # Find the specific service principal in the list
         $SPResult = $TenantInfo | Where-Object { $_.appId -eq $AppId } | Select-Object -First 1
+
+        # Determine the source app's sign-in audience so we only build Enterprise App
+        # templates for genuinely multi-tenant apps. A single-tenant app (AzureADMyOrg)
+        # cannot be deployed via an appId-based service principal, and copying it to the
+        # partner tenant as multi-tenant produces a template that fails to deploy. Those
+        # apps must use a Manifest (single-tenant) template instead.
+        $MultiTenantAudiences = @('AzureADMultipleOrgs', 'AzureADandPersonalMicrosoftAccount')
+        $SignInAudience = $AppResult.body.signInAudience
+        if ([string]::IsNullOrWhiteSpace($SignInAudience)) {
+            $SignInAudience = $SPResult.signInAudience
+        }
+        if (-not [string]::IsNullOrWhiteSpace($SignInAudience) -and $SignInAudience -notin $MultiTenantAudiences) {
+            throw "Application '$DisplayName' is single-tenant (signInAudience '$SignInAudience') and cannot be used as an Enterprise App template. Create a Manifest (single-tenant) template for this app instead."
+        }
 
         # Get the app details based on type
         if ($Type -eq 'servicePrincipal') {
@@ -222,6 +236,17 @@ function Invoke-ExecCreateAppTemplate {
         $PermissionSetId = $null
         $PermissionSetName = "$DisplayName (Auto-created)"
 
+        # The service principal fallback above emits a separate entry for delegated access
+        # (oauth2PermissionGrants) and application access (appRoleAssignments), so a resource that has
+        # both appears twice. $CIPPPermissions is keyed by resourceAppId, so without merging here the
+        # second entry overwrites the first and one of the two permission types is silently discarded.
+        $Permissions = @($Permissions | Group-Object -Property resourceAppId | ForEach-Object {
+                [PSCustomObject]@{
+                    resourceAppId  = $_.Name
+                    resourceAccess = @($_.Group.resourceAccess)
+                }
+            })
+
         if ($Permissions -and $Permissions.Count -gt 0) {
             # Build bulk requests to get all service principals efficiently using object IDs from cached list
             $BulkRequests = [System.Collections.Generic.List[object]]::new()
@@ -320,9 +345,11 @@ function Invoke-ExecCreateAppTemplate {
                     }
                 }
 
+                # A resource can carry several oauth2PermissionGrants rows (an AllPrincipals grant plus
+                # per-user grants), which repeats the same scope once merged, so dedupe on the claim value.
                 $CIPPPermissions[$ResourceAppId] = [PSCustomObject]@{
-                    applicationPermissions = @($AppPerms)
-                    delegatedPermissions   = @($DelegatedPerms)
+                    applicationPermissions = @($AppPerms | Sort-Object -Property value -Unique)
+                    delegatedPermissions   = @($DelegatedPerms | Sort-Object -Property value -Unique)
                 }
             }
 

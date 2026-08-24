@@ -87,6 +87,43 @@ function New-CIPPAlertTemplate {
         $ButtonUrl = "$CIPPURL/standards/list-standards"
         $ButtonText = 'Check Standards configuration'
     }
+    if ($InputObject -eq 'customScript') {
+        # $Data is an array of custom-test alert records (one per failing test for this tenant).
+        $Alerts = @($Data)
+        $Count = $Alerts.Count
+        $Title = if ($Count -eq 1) {
+            "$($Tenant) - Custom test '$($Alerts[0].ScriptName)' returned status '$($Alerts[0].Status)'"
+        } else {
+            "$($Tenant) - $Count custom tests need attention"
+        }
+
+        $SummaryRows = foreach ($Alert in $Alerts) {
+            [PSCustomObject]@{
+                Test   = $Alert.ScriptName
+                Status = $Alert.Status
+                Risk   = if ($Alert.Risk) { $Alert.Risk } else { 'Medium' }
+            }
+        }
+        $SummaryHTML = ($SummaryRows | ConvertTo-Html -Fragment | Out-String).Replace('<table>', ' <table class="table-modern">')
+        $IntroText = "<p>You're receiving this because you enabled failure alerts for one or more custom tests. The following custom test(s) on tenant <strong>$($Tenant)</strong> need attention:</p>$SummaryHTML"
+
+        foreach ($Alert in $Alerts) {
+            $IntroText += "<h3>$($Alert.ScriptName) — $($Alert.Status)</h3>"
+            if (![string]::IsNullOrWhiteSpace($Alert.ErrorMessage)) {
+                $IntroText += "<p>The test failed to execute: $($Alert.ErrorMessage)</p>"
+            } elseif (![string]::IsNullOrWhiteSpace($Alert.ResultMarkdown)) {
+                $IntroText += "<div style='background-color: #f8f9fa; border-left: 4px solid #007bff; padding: 15px; margin: 15px 0; white-space: pre-wrap;'>$($Alert.ResultMarkdown)</div>"
+            } elseif ($Alert.FailedRows) {
+                # Normalize string rows to objects so ConvertTo-Html renders a message column
+                # instead of the string's Length property.
+                $Rows = foreach ($r in @($Alert.FailedRows)) { if ($r -is [string]) { [PSCustomObject]@{ message = $r } } else { $r } }
+                $DetailHTML = ($Rows | Select-Object * -ExcludeProperty Etag, PartitionKey, TimeStamp | ConvertTo-Html -Fragment | Out-String).Replace('<table>', ' <table class="table-modern">')
+                $IntroText += "<p>Results:</p>$DetailHTML"
+            }
+        }
+        $ButtonUrl = "$CIPPURL/tools/custom-tests"
+        $ButtonText = 'View custom test results'
+    }
     if ($InputObject -eq 'auditlog') {
         $ButtonUrl = "$CIPPURL/identity/administration/users/user/bec?userId=$($data.ObjectId)&tenantFilter=$Tenant"
         $ButtonText = 'User Management'
@@ -273,16 +310,65 @@ function New-CIPPAlertTemplate {
                 $ButtonText = 'User Management'
             }
         }
+
+        # Append a deep-link to the source audit event so technicians can jump straight from
+        # the ticket to the raw record in CIPP for forensics, regardless of which action page
+        # the primary button takes them to.
+        if (![string]::IsNullOrWhiteSpace($AuditLogLink)) {
+            $AfterButtonText = "$AfterButtonText<p>For forensics, <a href=`"$AuditLogLink`">view the source audit event in CIPP</a>.</p>"
+        }
     }
 
     if (![string]::IsNullOrWhiteSpace($CustomSubject)) {
-        $Title = '{0} - {1}' -f $Tenant, $CustomSubject
+        # Resolve %property% tokens against the alert data so subjects like
+        # '%username% - suspicious login' carry the actual value. Unknown tokens stay as-is.
+        # $Data is a single object for audit logs but an array of rows for logbook alerts,
+        # so only resolve when every row agrees - a multi-user alert has no one username.
+        $ResolvedSubject = [regex]::Replace($CustomSubject, '%(\w+)%', {
+            param($Match)
+            $PropertyName = switch ($Match.Groups[1].Value) {
+                'username' { 'UserId' }
+                'tenant' { return $Tenant }
+                default { $Match.Groups[1].Value }
+            }
+            $Values = foreach ($Row in @($Data)) {
+                if ($null -eq $Row) { continue }
+                if ($Row -is [System.Collections.IDictionary]) {
+                    $Row[$PropertyName]
+                } else {
+                    ($Row.PSObject.Properties | Where-Object { $_.Name -ieq $PropertyName } | Select-Object -First 1).Value
+                }
+            }
+            $Distinct = @($Values | Where-Object { ![string]::IsNullOrWhiteSpace("$_") } | ForEach-Object { "$_" } | Select-Object -Unique)
+            if ($Distinct.Count -eq 1) { $Distinct[0] } else { $Match.Value }
+        })
+        $Title = '{0} - {1}' -f $Tenant, $ResolvedSubject
     }
 
     if ($Format -eq 'html') {
+        $AssembledHtml = $HTMLTemplate -f $Title, $IntroText, $ButtonUrl, $ButtonText, $AfterButtonText, $AuditLogLink
+        $AssembledHtml = $AssembledHtml -replace '\r\n', '' -replace '\n', ''
         return [pscustomobject]@{
             title       = $Title
-            htmlcontent = $HTMLTemplate -f $Title, $IntroText, $ButtonUrl, $ButtonText, $AfterButtonText, $AuditLogLink
+            htmlcontent = $AssembledHtml
+        }
+    } elseif ($Format -eq 'psa') {
+        # PSA ticket bodies get a bare fragment instead of the full email template: the
+        # template styles its tables with a <style> block and classes, which Halo stores
+        # but never applies, so the tables lose their borders and padding (#4243).
+        $PsaContent = $IntroText
+        if ($ButtonUrl -and $ButtonText) {
+            $PsaContent = "$PsaContent<p><a href=`"$ButtonUrl`">$ButtonText</a></p>"
+        }
+        if ($AfterButtonText) {
+            $PsaContent = "$PsaContent$AfterButtonText"
+        }
+        if ($AuditLogLink) {
+            $PsaContent = "$PsaContent<p><a href=`"$AuditLogLink`">View the audit log entry in CIPP</a></p>"
+        }
+        return [pscustomobject]@{
+            title       = $Title
+            htmlcontent = (ConvertTo-PSAHtml -Html $PsaContent)
         }
     } elseif ($Format -eq 'json') {
         if ($InputObject -eq 'auditlog') {

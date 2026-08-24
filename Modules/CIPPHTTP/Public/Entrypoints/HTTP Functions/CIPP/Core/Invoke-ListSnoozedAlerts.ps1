@@ -3,7 +3,9 @@ function Invoke-ListSnoozedAlerts {
     .FUNCTIONALITY
         Entrypoint,AnyTenant
     .ROLE
-        CIPP.Alert.Read
+        CIPP.AlertSnooze.Read
+    .DESCRIPTION
+        Lists alerts that have been snoozed (temporarily suppressed), filterable by cmdlet name. Returns snooze duration and scope details.
     #>
     [CmdletBinding()]
     param($Request, $TriggerMetadata)
@@ -23,6 +25,11 @@ function Invoke-ListSnoozedAlerts {
             $SnoozeRecords = Get-CIPPAzDataTableEntity @SnoozeTable
         }
 
+        # AnyTenant skips the framework's per-tenant check, and snooze rows carry alert content
+        # previews. Narrow to the caller's allowed tenants (dropping estate-wide rows for
+        # restricted callers); unrestricted callers pass through untouched.
+        $SnoozeRecords = $SnoozeRecords | Select-CippAllowedTenantData -TenantProperty 'Tenant'
+
 
 
         $CurrentUnixTime = [int64](([datetime]::UtcNow) - (Get-Date '1/1/1970')).TotalSeconds
@@ -39,7 +46,9 @@ function Invoke-ListSnoozedAlerts {
                     RowKey         = $_.RowKey
                     CmdletName     = $_.PartitionKey
                     Tenant         = $_.Tenant
+                    ContentHash    = $_.ContentHash
                     ContentPreview = $_.ContentPreview
+                    SnoozeReason   = $_.SnoozeReason
                     SnoozedBy      = $_.SnoozedBy
                     SnoozedAt      = $_.SnoozedAt
                     SnoozeUntil    = $_.SnoozeUntil

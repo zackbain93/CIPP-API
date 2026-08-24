@@ -4,6 +4,8 @@ function Invoke-ListTransportRules {
         Entrypoint
     .ROLE
         Exchange.TransportRule.Read
+    .DESCRIPTION
+        Lists mail flow (transport) rules configured in Exchange Online, with optional detailed view by rule ID.
     #>
     [CmdletBinding()]
     param($Request, $TriggerMetadata)
@@ -61,7 +63,7 @@ function Invoke-ListTransportRules {
                     $Metadata = [PSCustomObject]@{
                         QueueId = $RunningQueue.RowKey ?? $null
                     }
-                    $Rules = $Rows
+                    $Rules = $Rows | Select-CippAllowedTenantData -TenantProperty 'Tenant'
                     foreach ($rule in $Rules) {
                         $RuleObj = $rule.TransportRule | ConvertFrom-Json
                         $RuleObj | Add-Member -MemberType NoteProperty -Name Tenant -Value $rule.Tenant -Force

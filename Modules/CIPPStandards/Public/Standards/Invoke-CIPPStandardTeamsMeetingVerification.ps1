@@ -34,18 +34,18 @@ function Invoke-CIPPStandardTeamsMeetingVerification {
         UPDATECOMMENTBLOCK
             Run the Tools\Update-StandardsComments.ps1 script to update this comment block
     .LINK
-        https://docs.cipp.app/user-documentation/tenant/standards/list-standards
+        https://docs.cipp.app/user-documentation/tenant/standards/alignment/templates/available-standards
     #>
 
     param($Tenant, $Settings)
-    $TestResult = Test-CIPPStandardLicense -StandardName 'TeamsMeetingVerification' -TenantFilter $Tenant -RequiredCapabilities @('MCOSTANDARD', 'MCOEV', 'MCOIMP', 'TEAMS1', 'Teams_Room_Standard')
+    $TestResult = Test-CIPPStandardLicense -StandardName 'TeamsMeetingVerification' -TenantFilter $Tenant -Preset Teams
 
     if ($TestResult -eq $false) {
         return $true
     } #we're done.
 
     try {
-        $CurrentState = New-TeamsRequest -TenantFilter $Tenant -Cmdlet 'Get-CsTeamsMeetingPolicy' -CmdParams @{Identity = 'Global' } |
+        $CurrentState = New-TeamsRequestV2 -TenantFilter $Tenant -Type 'TeamsMeetingPolicy' -Action Get -Identity 'Global' |
             Select-Object CaptchaVerificationForMeetingJoin
     } catch {
         $ErrorMessage = Get-NormalizedError -Message $_.Exception.Message
@@ -66,7 +66,7 @@ function Invoke-CIPPStandardTeamsMeetingVerification {
             }
 
             try {
-                New-TeamsRequest -TenantFilter $Tenant -Cmdlet 'Set-CsTeamsMeetingPolicy' -CmdParams $cmdParams
+                $null = New-TeamsRequestV2 -TenantFilter $Tenant -Type 'TeamsMeetingPolicy' -Action Set -Parameters $cmdParams
                 Write-LogMessage -API 'Standards' -tenant $Tenant -message 'Updated Teams Meeting Verification Policy' -sev Info
             } catch {
                 $ErrorMessage = Get-CippException -Exception $_

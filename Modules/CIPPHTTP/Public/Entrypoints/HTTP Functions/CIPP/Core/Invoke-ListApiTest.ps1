@@ -4,6 +4,8 @@ function Invoke-ListApiTest {
         Entrypoint,AnyTenant
     .ROLE
         CIPP.Core.Read
+    .DESCRIPTION
+        Returns debug information about the current API request, trigger metadata, and environment variables. Used for CIPP platform diagnostics.
     #>
     [CmdletBinding()]
     param($Request, $TriggerMetadata)
@@ -25,8 +27,13 @@ function Invoke-ListApiTest {
         $Request = New-CIPPAzRestRequest -Method POST -Resource 'https://management.azure.com/' -Uri 'https://management.azure.com/providers/Microsoft.ResourceGraph/resources?api-version=2022-10-01' -Body $Json
         $Response.ResourceGraphTest = $Request
     }
-    $Response.AllowedTenants = $script:CippAllowedTenantsStorage.Value
-    $Response.AllowedGroups = $script:CippAllowedGroupsStorage.Value
+    # Has to come from CIPPCore. These slots are module scoped, so reading $script:Cipp*Storage
+    # from here would return CIPPHTTP's own - always empty - variables and report that no tenant
+    # scoping is applied regardless of what is actually in force.
+    $RequestContext = Get-CippRequestContext
+    $Response.AllowedTenants = $RequestContext.AllowedTenants
+    $Response.AllowedGroups = $RequestContext.AllowedGroups
+    $Response.RequestContext = $RequestContext
 
     return ([HttpResponseContext]@{
             StatusCode = [HttpStatusCode]::OK

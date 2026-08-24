@@ -33,18 +33,18 @@ function Invoke-CIPPStandardTeamsGuestAccess {
         UPDATECOMMENTBLOCK
             Run the Tools\Update-StandardsComments.ps1 script to update this comment block
     .LINK
-        https://docs.cipp.app/user-documentation/tenant/standards/list-standards
+        https://docs.cipp.app/user-documentation/tenant/standards/alignment/templates/available-standards
     #>
 
     param($Tenant, $Settings)
-    $TestResult = Test-CIPPStandardLicense -StandardName 'TeamsGuestAccess' -TenantFilter $Tenant -RequiredCapabilities @('MCOSTANDARD', 'MCOEV', 'MCOIMP', 'TEAMS1', 'Teams_Room_Standard')
+    $TestResult = Test-CIPPStandardLicense -StandardName 'TeamsGuestAccess' -TenantFilter $Tenant -Preset Teams
 
     if ($TestResult -eq $false) {
         return $true
     } #we're done.
 
     try {
-        $CurrentState = New-TeamsRequest -TenantFilter $Tenant -Cmdlet 'Get-CsTeamsClientConfiguration' -CmdParams @{Identity = 'Global' } |
+        $CurrentState = New-TeamsRequestV2 -TenantFilter $Tenant -Type 'TeamsClientConfiguration' -Action Get -Identity 'Global' |
             Select-Object AllowGuestUser
     } catch {
         $ErrorMessage = Get-NormalizedError -Message $_.Exception.Message
@@ -66,7 +66,7 @@ function Invoke-CIPPStandardTeamsGuestAccess {
             }
 
             try {
-                New-TeamsRequest -TenantFilter $Tenant -Cmdlet 'Set-CsTeamsClientConfiguration' -CmdParams $cmdParams
+                $null = New-TeamsRequestV2 -TenantFilter $Tenant -Type 'TeamsClientConfiguration' -Action Set -Parameters $cmdParams
                 Write-LogMessage -API 'Standards' -tenant $Tenant -message 'Updated Teams Guest Access settings' -sev Info
             } catch {
                 $ErrorMessage = Get-NormalizedError -Message $_.Exception.Message

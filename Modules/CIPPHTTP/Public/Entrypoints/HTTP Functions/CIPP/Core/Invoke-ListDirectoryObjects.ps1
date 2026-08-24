@@ -4,12 +4,25 @@ function Invoke-ListDirectoryObjects {
         Entrypoint,AnyTenant
     .ROLE
         CIPP.Core.Read
+    .DESCRIPTION
+        Resolves Entra ID directory objects by their IDs using the directoryObjects/getByIds batch endpoint. Accepts an array of object IDs in the request body.
     #>
     [CmdletBinding()]
     param($Request, $TriggerMetadata)
     $TenantFilter = $Request.Body.partnerLookup ? $env:TenantID : $Request.Body.tenantFilter
     $AsApp = $Request.Body.asApp
     $Ids = $Request.Body.ids
+
+    # AnyTenant: enforce tenant scope here; Get-Tenants is narrowed to the caller's allowed tenants
+    if (-not $Request.Body.partnerLookup) {
+        $AllowedTenants = Test-CIPPAccess -Request $Request -TenantList
+        if ($AllowedTenants -notcontains 'AllTenants' -and -not (Get-Tenants -TenantFilter $TenantFilter)) {
+            return ([HttpResponseContext]@{
+                    StatusCode = [System.Net.HttpStatusCode]::Forbidden
+                    Body       = 'Access to this tenant is not allowed'
+                })
+        }
+    }
 
     $BaseUri = 'https://graph.microsoft.com/beta/directoryObjects/getByIds'
     if ($Request.Body.'$select') {

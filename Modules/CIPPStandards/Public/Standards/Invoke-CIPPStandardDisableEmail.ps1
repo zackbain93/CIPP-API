@@ -28,7 +28,7 @@ function Invoke-CIPPStandardDisableEmail {
         UPDATECOMMENTBLOCK
             Run the Tools\Update-StandardsComments.ps1 script to update this comment block
     .LINK
-        https://docs.cipp.app/user-documentation/tenant/standards/list-standards
+        https://docs.cipp.app/user-documentation/tenant/standards/alignment/templates/available-standards
     #>
 
     param($Tenant, $Settings)
@@ -49,6 +49,8 @@ function Invoke-CIPPStandardDisableEmail {
             try {
                 Set-CIPPAuthenticationPolicy -Tenant $tenant -APIName 'Standards' -AuthenticationMethodId 'Email' -Enabled $false
             } catch {
+                $ErrorMessage = Get-CippException -Exception $_
+                Write-LogMessage -API 'Standards' -tenant $tenant -message "Failed to disable Email authentication method. Error: $($ErrorMessage.NormalizedError)" -sev Error -LogData $ErrorMessage
             }
         }
     }

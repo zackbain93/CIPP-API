@@ -56,7 +56,7 @@ function Invoke-CIPPStandardDefenderAVPolicy {
         UPDATECOMMENTBLOCK
             Run the Tools\Update-StandardsComments.ps1 script to update this comment block
     .LINK
-        https://docs.cipp.app/user-documentation/tenant/standards/list-standards
+        https://docs.cipp.app/user-documentation/tenant/standards/alignment/templates/available-standards
     #>
 
     param($Tenant, $Settings)
@@ -134,7 +134,7 @@ function Invoke-CIPPStandardDefenderAVPolicy {
 
     # Check existing policies
     try {
-        $ExistingPolicies = New-GraphGETRequest -uri 'https://graph.microsoft.com/beta/deviceManagement/configurationPolicies' -tenantid $Tenant
+        $ExistingPolicies = New-GraphGETRequest -uri 'https://graph.microsoft.com/beta/deviceManagement/configurationPolicies?$select=id,name' -tenantid $Tenant
     } catch {
         $ErrorMessage = Get-NormalizedError -Message $_.Exception.Message
         Write-LogMessage -API 'Standards' -tenant $Tenant -message "Failed to retrieve configuration policies: $ErrorMessage" -sev Error

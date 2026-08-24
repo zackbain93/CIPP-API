@@ -34,7 +34,7 @@ function Invoke-CIPPStandardAddDMARCToMOERA {
         UPDATECOMMENTBLOCK
             Run the Tools\Update-StandardsComments.ps1 script to update this comment block
     .LINK
-        https://docs.cipp.app/user-documentation/tenant/standards/list-standards
+        https://docs.cipp.app/user-documentation/tenant/standards/alignment/templates/available-standards
     #>
 
     param($Tenant, $Settings)
@@ -46,7 +46,7 @@ function Invoke-CIPPStandardAddDMARCToMOERA {
     try {
         $DomainsResponse = New-GraphGetRequest -TenantID $Tenant -Uri 'https://graph.microsoft.com/beta/domains'
         Write-Warning ($DomainsResponse | ConvertTo-Json -Depth 5)
-        $Domains = @($DomainsResponse | Where-Object { $_.id -like '*.onmicrosoft.com' } | ForEach-Object { $_.id })
+        $Domains = @($DomainsResponse | Where-Object { $_.id -like '*.onmicrosoft.com' -and $_.id -notlike '*.mail.onmicrosoft.com' } | ForEach-Object { $_.id })
         Write-Information "Detected $($Domains.Count) MOERA domains: $($Domains -join ', ')"
 
         $CurrentInfo = foreach ($Domain in $Domains) {

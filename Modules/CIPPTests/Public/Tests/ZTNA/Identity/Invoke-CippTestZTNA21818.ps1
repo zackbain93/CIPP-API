@@ -68,8 +68,10 @@ function Invoke-CippTestZTNA21818 {
         $ExitLoop = $false
 
         foreach ($Role in $PrivilegedRoles) {
+            # roleDefinitionId carries the role's TEMPLATE id — matching it against $Role.id (the
+            # directoryRole instance id) never succeeded.
             $Policy = $RoleManagementPolicies | Where-Object {
-                $_.scopeId -eq '/' -and $_.scopeType -eq 'DirectoryRole' -and $_.roleDefinitionId -eq $Role.id
+                $_.scopeId -eq '/' -and $_.scopeType -eq 'DirectoryRole' -and $_.roleDefinitionId -eq $Role.roleTemplateId
             } | Select-Object -First 1
 
             if (-not $Policy) { continue }
@@ -93,19 +95,19 @@ function Invoke-CippTestZTNA21818 {
         }
 
         if ($Passed) {
-            $ResultMarkdown = "Role notifications are properly configured for privileged role.`n`n"
+            $ResultMarkdown = [System.Text.StringBuilder]::new("Role notifications are properly configured for privileged role.`n`n")
         } else {
-            $ResultMarkdown = "Role notifications are not properly configured.`n`nNote: To save time, this check stops when it finds the first role that does not have notifications. After fixing this role and all other roles, we recommend running the check again to verify.`n`n"
+            $ResultMarkdown = [System.Text.StringBuilder]::new("Role notifications are not properly configured.`n`nNote: To save time, this check stops when it finds the first role that does not have notifications. After fixing this role and all other roles, we recommend running the check again to verify.`n`n")
         }
 
-        $ResultMarkdown += "## Notifications for high privileged roles`n`n"
-        $ResultMarkdown += "| Role Name | Notification Scenario | Notification Type | Default Recipients Enabled | Additional Recipients |`n"
-        $ResultMarkdown += "| :-------- | :-------------------- | :---------------- | :------------------------- | :-------------------- |`n"
+        $null = $ResultMarkdown.Append("## Notifications for high privileged roles`n`n")
+        $null = $ResultMarkdown.Append("| Role Name | Notification Scenario | Notification Type | Default Recipients Enabled | Additional Recipients |`n")
+        $null = $ResultMarkdown.Append("| :-------- | :-------------------- | :---------------- | :------------------------- | :-------------------- |`n")
 
         foreach ($NotificationRule in $NotificationRules) {
             $MatchingNotification = $Notifications | Where-Object { $_.RuleId -eq $NotificationRule.id }
             $Recipients = if ($NotificationRule.notificationRecipients) { ($NotificationRule.notificationRecipients -join ', ') } else { '' }
-            $ResultMarkdown += "| $($NotificationRule.roleDisplayName) | $($MatchingNotification.notificationScenario) | $($MatchingNotification.notificationType) | $($NotificationRule.isDefaultRecipientsEnabled) | $Recipients |`n"
+            $null = $ResultMarkdown.Append("| $($NotificationRule.roleDisplayName) | $($MatchingNotification.notificationScenario) | $($MatchingNotification.notificationType) | $($NotificationRule.isDefaultRecipientsEnabled) | $Recipients |`n")
         }
 
         $Status = if ($Passed) { 'Passed' } else { 'Failed' }

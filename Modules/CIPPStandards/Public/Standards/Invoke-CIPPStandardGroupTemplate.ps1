@@ -31,11 +31,17 @@ function Invoke-CIPPStandardGroupTemplate {
         UPDATECOMMENTBLOCK
             Run the Tools\Update-StandardsComments.ps1 script to update this comment block
     .LINK
-        https://docs.cipp.app/user-documentation/tenant/standards/list-standards
+        https://docs.cipp.app/user-documentation/tenant/standards/alignment/templates/available-standards
     #>
     param($Tenant, $Settings)
 
-    $existingGroups = New-GraphGETRequest -uri 'https://graph.microsoft.com/beta/groups?$top=999&$select=id,displayName,description,membershipRule' -tenantid $tenant
+    try {
+        $existingGroups = New-GraphGETRequest -uri 'https://graph.microsoft.com/beta/groups?$top=999&$select=id,displayName,description,membershipRule' -tenantid $tenant -ErrorAction Stop
+    } catch {
+        $ErrorMessage = Get-NormalizedError -Message $_.Exception.Message
+        Write-LogMessage -API 'Standards' -tenant $tenant -message "Group Template: could not read the tenant's existing groups, skipping this run to avoid creating duplicate groups. Error: $ErrorMessage" -sev 'Error'
+        return
+    }
 
     $Settings.groupTemplate ? ($Settings | Add-Member -NotePropertyName 'TemplateList' -NotePropertyValue $Settings.groupTemplate) : $null
 
@@ -44,8 +50,13 @@ function Invoke-CIPPStandardGroupTemplate {
     $GroupTemplates = (Get-CIPPAzDataTableEntity @Table -Filter $Filter).JSON | ConvertFrom-Json
 
     if ('dynamicDistribution' -in $GroupTemplates.groupType) {
-        # Get dynamic distro list from exchange
-        $DynamicDistros = New-ExoRequest -cmdlet 'Get-DynamicDistributionGroup' -tenantid $tenant -Select 'Identity,Name,Alias,RecipientFilter,PrimarySmtpAddress'
+        try {
+            $DynamicDistros = New-ExoRequest -cmdlet 'Get-DynamicDistributionGroup' -tenantid $tenant -Select 'Identity,Name,Alias,RecipientFilter,PrimarySmtpAddress' -ErrorAction Stop
+        } catch {
+            $ErrorMessage = Get-NormalizedError -Message $_.Exception.Message
+            Write-LogMessage -API 'Standards' -tenant $tenant -message "Group Template: could not read the tenant's existing dynamic distribution groups, skipping this run to avoid creating duplicate groups. Error: $ErrorMessage" -sev 'Error'
+            return
+        }
     }
 
     if ($Settings.remediate -eq $true) {
@@ -67,7 +78,7 @@ function Invoke-CIPPStandardGroupTemplate {
 
                     # Check if Exchange license is required for distribution groups
                     if ($groupobj.groupType -in @('distribution', 'dynamicdistribution')) {
-                        $TestResult = Test-CIPPStandardLicense -StandardName 'GroupTemplate' -TenantFilter $Tenant -RequiredCapabilities @('EXCHANGE_S_STANDARD', 'EXCHANGE_S_ENTERPRISE', 'EXCHANGE_LITE') -SkipLog
+                        $TestResult = Test-CIPPStandardLicense -StandardName 'GroupTemplate' -TenantFilter $Tenant -Preset Exchange -SkipLog
                         if (!$TestResult) {
                             Write-LogMessage -API 'Standards' -tenant $tenant -message "Cannot create group $($groupobj.displayname) as the tenant is not licensed for Exchange." -Sev 'Error'
                             continue
@@ -132,7 +143,7 @@ function Invoke-CIPPStandardGroupTemplate {
 
                     } else {
                         # Handle Exchange Online groups (Distribution, DynamicDistribution)
-                        $TestResult = Test-CIPPStandardLicense -StandardName 'GroupTemplate' -TenantFilter $Tenant -RequiredCapabilities @('EXCHANGE_S_STANDARD', 'EXCHANGE_S_ENTERPRISE', 'EXCHANGE_LITE') -SkipLog
+                        $TestResult = Test-CIPPStandardLicense -StandardName 'GroupTemplate' -TenantFilter $Tenant -Preset Exchange -SkipLog
                         if (!$TestResult) {
                             Write-LogMessage -API 'Standards' -tenant $tenant -message "Cannot update group $($groupobj.displayName) as the tenant is not licensed for Exchange." -Sev 'Error'
                             continue

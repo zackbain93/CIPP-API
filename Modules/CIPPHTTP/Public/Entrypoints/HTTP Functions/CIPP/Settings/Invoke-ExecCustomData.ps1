@@ -14,6 +14,18 @@ function Invoke-ExecCustomData {
 
     Write-Information "Executing action '$Action'"
 
+    # AnyTenant: mapping writes re-register per-tenant sync tasks estate-wide, so they
+    # require an unrestricted tenant scope
+    if ($Action -in @('AddEditMapping', 'DeleteMapping')) {
+        $AllowedTenants = Test-CIPPAccess -Request $Request -TenantList
+        if ($AllowedTenants -notcontains 'AllTenants') {
+            return ([HttpResponseContext]@{
+                    StatusCode = [HttpStatusCode]::Forbidden
+                    Body       = @{ Results = @(@{ state = 'error'; resultText = 'Editing custom data mappings requires unrestricted tenant access' }) }
+                })
+        }
+    }
+
     switch ($Action) {
         'ListSchemaExtensions' {
             try {
@@ -95,7 +107,7 @@ function Invoke-ExecCustomData {
 
 
                 # Delete the schema extension entity
-                Remove-AzDataTableEntity @CustomDataTable -Entity $SchemaEntity
+                Remove-CIPPAzDataTableEntity @CustomDataTable -Entity $SchemaEntity
 
                 $Body = @{
                     Results = @{
@@ -326,7 +338,7 @@ function Invoke-ExecCustomData {
                     $ExtensionEntity = Get-CIPPAzDataTableEntity @CustomDataTable -Filter "PartitionKey eq 'DirectoryExtension' and RowKey eq '$ExtensionName'"
                     # Remove the extension from the custom data table
                     if ($ExtensionEntity) {
-                        Remove-AzDataTableEntity @CustomDataTable -Entity $ExtensionEntity
+                        Remove-CIPPAzDataTableEntity @CustomDataTable -Entity $ExtensionEntity
                     }
                 } catch {
                     Write-Warning "Failed to delete directory extension from custom data table: $($_.Exception.Message)"
@@ -358,8 +370,22 @@ function Invoke-ExecCustomData {
         }
         'ListMappings' {
             try {
+                # AnyTenant: restricted callers only see mappings for tenants in scope
+                $AllowedTenants = Test-CIPPAccess -Request $Request -TenantList
+                $Restricted = $AllowedTenants -notcontains 'AllTenants'
+                if ($Restricted) {
+                    $AllowedIdentifiers = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+                    foreach ($Tenant in (Get-Tenants -IncludeErrors)) {
+                        foreach ($Value in @($Tenant.customerId, $Tenant.defaultDomainName)) {
+                            if ($Value) { [void]$AllowedIdentifiers.Add([string]$Value) }
+                        }
+                    }
+                }
                 $Mappings = Get-CIPPAzDataTableEntity @CustomDataMappingsTable | ForEach-Object {
                     $Mapping = $_.JSON | ConvertFrom-Json -AsHashtable
+                    if ($Restricted -and -not (@($Mapping.tenantFilter.value) | Where-Object { $_ -and $AllowedIdentifiers.Contains([string]$_) })) {
+                        return
+                    }
 
                     Write-Information ($Mapping | ConvertTo-Json -Depth 5)
                     [PSCustomObject]@{
@@ -433,7 +459,7 @@ function Invoke-ExecCustomData {
                 }
 
                 # Delete the mapping entity
-                Remove-AzDataTableEntity @CustomDataMappingsTable -Entity $MappingEntity
+                Remove-CIPPAzDataTableEntity @CustomDataMappingsTable -Entity $MappingEntity
                 Register-CIPPExtensionScheduledTasks
                 $Body = @{
                     Results = @{

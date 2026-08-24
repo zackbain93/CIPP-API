@@ -4,16 +4,21 @@ function Invoke-ListMailboxRules {
         Entrypoint
     .ROLE
         Exchange.Mailbox.Read
+    .DESCRIPTION
+        Lists inbox rules configured on mailboxes in a tenant. Supports UseReportDB=true query parameter to retrieve cached data from the reporting database for significantly better performance, especially when querying AllTenants.
     #>
     [CmdletBinding()]
     param($Request, $TriggerMetadata)
     # Interact with query parameters or the body of the request.
     $TenantFilter = $Request.Query.tenantFilter
-    $UseReportDB = $Request.Query.UseReportDB
-
+    if (-not [string]::IsNullOrEmpty($TenantFilter) -and $TenantFilter -ne 'AllTenants') {
+        $TenantFilter = ConvertTo-CIPPODataFilterValue -Value $TenantFilter -Type String
+    }
+    # Serve from the reporting database cache instead of live Graph. Much faster, especially for AllTenants.
+    $UseReportDB = $Request.Query.UseReportDB -eq $true
     try {
         # If UseReportDB is specified, retrieve from report database
-        if ($UseReportDB -eq 'true') {
+        if ($UseReportDB) {
             try {
                 $GraphRequest = Get-CIPPMailboxRulesReport -TenantFilter $TenantFilter -ErrorAction Stop
                 $StatusCode = [HttpStatusCode]::OK
@@ -83,7 +88,7 @@ function Invoke-ListMailboxRules {
             $Metadata = [PSCustomObject]@{
                 QueueId = $RunningQueue.RowKey ?? $null
             }
-            $GraphRequest = $Rows | ForEach-Object {
+            $GraphRequest = $Rows | Select-CippAllowedTenantData -TenantProperty 'Tenant' | ForEach-Object {
                 $NewObj = $_.Rules | ConvertFrom-Json -ErrorAction SilentlyContinue
                 $NewObj | Add-Member -NotePropertyName 'Tenant' -NotePropertyValue $_.Tenant -Force
                 $NewObj

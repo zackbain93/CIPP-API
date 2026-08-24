@@ -45,6 +45,8 @@ function Get-CIPPFeatureFlag {
                     Timers          = $FeatureFlag.Timers
                     Endpoints       = $FeatureFlag.Endpoints
                     Pages           = $FeatureFlag.Pages
+                    HidesPages      = $FeatureFlag.HidesPages
+                    Hidden          = [bool]$FeatureFlag.Hidden
                     Enabled         = $TableFlag.Enabled
                 }
             } else {
@@ -65,6 +67,8 @@ function Get-CIPPFeatureFlag {
                     Timers          = $FeatureFlag.Timers
                     Endpoints       = $FeatureFlag.Endpoints
                     Pages           = $FeatureFlag.Pages
+                    HidesPages      = $FeatureFlag.HidesPages
+                    Hidden          = [bool]$FeatureFlag.Hidden
                     Enabled         = $FeatureFlag.Enabled
                 }
             }
@@ -83,6 +87,8 @@ function Get-CIPPFeatureFlag {
                         Timers          = $FeatureFlag.Timers
                         Endpoints       = $FeatureFlag.Endpoints
                         Pages           = $FeatureFlag.Pages
+                        HidesPages      = $FeatureFlag.HidesPages
+                        Hidden          = [bool]$FeatureFlag.Hidden
                         Enabled         = $TableFlag.Enabled
                     }
                 } else {
@@ -103,6 +109,8 @@ function Get-CIPPFeatureFlag {
                         Timers          = $FeatureFlag.Timers
                         Endpoints       = $FeatureFlag.Endpoints
                         Pages           = $FeatureFlag.Pages
+                        HidesPages      = $FeatureFlag.HidesPages
+                        Hidden          = [bool]$FeatureFlag.Hidden
                         Enabled         = $FeatureFlag.Enabled
                     }
                 }

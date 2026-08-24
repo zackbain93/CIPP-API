@@ -4,6 +4,8 @@ function Invoke-ListAlertsQueue {
         Entrypoint
     .ROLE
         CIPP.Alert.Read
+    .DESCRIPTION
+        Lists configured alert rules including webhook rules and scheduled alert tasks, showing their configuration and tenant scope.
     #>
     [CmdletBinding()]
     param($Request, $TriggerMetadata)
@@ -34,6 +36,7 @@ function Invoke-ListAlertsQueue {
             RepeatsEvery    = 'When received'
             AlertComment    = $Task.AlertComment
             CustomSubject   = $Task.CustomSubject
+            Enabled         = $Task.Disabled -ne $true
             RawAlert        = @{
                 Conditions    = @($Conditions)
                 Actions       = @($($Task.Actions | ConvertFrom-Json -Depth 10 -ErrorAction SilentlyContinue))
@@ -86,6 +89,14 @@ function Invoke-ListAlertsQueue {
             $ExcludedTenants = @($Task.excludedTenants -split ',' | Where-Object { $_ })
         } else {
             $ExcludedTenants = @()
+        }
+        # Excluded tenant groups are stored separately as JSON — surface them as objects so the
+        # frontend renders a single named chip and can round-trip the group on edit
+        if ($Task.excludedTenantGroups) {
+            $ExcludedGroups = @($Task.excludedTenantGroups | ConvertFrom-Json -ErrorAction SilentlyContinue)
+            if ($ExcludedGroups) {
+                $ExcludedTenants = @($ExcludedTenants + $ExcludedGroups)
+            }
         }
 
         # Handle tenant display information for alerts
@@ -153,6 +164,7 @@ function Invoke-ListAlertsQueue {
             AlertComment    = $Task.AlertComment
             RawAlert        = $Task
             ScriptName      = $ScriptName
+            Enabled         = $Task.Disabled -ne $true
         }
 
         if ($AllowedTenants -notcontains 'AllTenants') {

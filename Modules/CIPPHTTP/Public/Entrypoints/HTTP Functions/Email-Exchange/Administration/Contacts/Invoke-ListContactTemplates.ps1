@@ -4,6 +4,8 @@ function Invoke-ListContactTemplates {
         Entrypoint,AnyTenant
     .ROLE
         Exchange.Contact.Read
+    .DESCRIPTION
+        Lists saved mail contact templates used for creating new Exchange contacts.
     #>
     [CmdletBinding()]
     param($Request, $TriggerMetadata)
@@ -12,7 +14,7 @@ function Invoke-ListContactTemplates {
 
 
     $Table = Get-CippTable -tablename 'templates'
-    $Templates = Get-ChildItem 'Config\*.ContactTemplate.json' | ForEach-Object {
+    $Templates = Get-ChildItem (Join-Path $env:CIPPRootPath 'Config\*.ContactTemplate.json') | ForEach-Object {
         $Entity = @{
             JSON         = "$(Get-Content $_)"
             RowKey       = "$($_.name)"

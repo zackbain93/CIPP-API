@@ -4,6 +4,8 @@ function Invoke-ExecAccessChecks {
         Entrypoint,AnyTenant
     .ROLE
         CIPP.AppSettings.Read
+    .DESCRIPTION
+        Runs the CIPP deployment's self-diagnostics and returns the result. Type selects the check: 'Permissions' verifies the SAM application's Graph permissions, 'Tenants' tests access to each tenant, and 'GDAP' inspects the GDAP relationships and role mappings. Results are cached for an hour unless SkipCache is true.
     #>
     [CmdletBinding()]
     param($Request, $TriggerMetadata)
@@ -14,10 +16,12 @@ function Invoke-ExecAccessChecks {
     $4HoursAgo = (Get-Date).AddHours(-1).ToUniversalTime()
     $TimestampFilter = $4HoursAgo.ToString('yyyy-MM-ddTHH:mm:ss.fffK')
 
+    # Re-run the check instead of serving the cached result.
+    $SkipCache = $Request.Query.SkipCache -eq $true
 
     switch ($Request.Query.Type) {
         'Permissions' {
-            if ($Request.Query.SkipCache -ne 'true' -or $Request.Query.SkipCache -ne $true) {
+            if (-not $SkipCache) {
                 try {
                     $Cache = Get-CIPPAzDataTableEntity @Table -Filter "RowKey eq 'AccessPermissions' and Timestamp and Timestamp ge datetime'$TimestampFilter'"
                     $Results = $Cache.Data | ConvertFrom-Json -ErrorAction Stop
@@ -48,9 +52,12 @@ function Invoke-ExecAccessChecks {
                             TenantId                  = $Tenant.customerId
                             TenantName                = $Tenant.displayName
                             DefaultDomainName         = $Tenant.defaultDomainName
+                            TenantType                = if ($Tenant.delegatedPrivilegeStatus -eq 'directTenant') { 'Direct' } else { 'GDAP' }
+                            ServiceAccount            = $Tenant.directTenantUserPrincipalName
+                            ServiceAccountLastAuth    = $Tenant.directTenantAuthDate
                             GraphStatus               = 'Not run yet'
                             ExchangeStatus            = 'Not run yet'
-                            GDAPRoles                 = ''
+                            AssignedRoles             = ''
                             MissingRoles              = ''
                             LastRun                   = ''
                             GraphTest                 = ''
@@ -63,7 +70,9 @@ function Invoke-ExecAccessChecks {
                             $Data = @($TenantCheck.Data | ConvertFrom-Json -ErrorAction Stop)
                             $TenantResult.GraphStatus = $Data.GraphStatus
                             $TenantResult.ExchangeStatus = $Data.ExchangeStatus
-                            $TenantResult.GDAPRoles = $Data.GDAPRoles
+                            # Fall back to the old property name so checks cached before the rename
+                            # keep rendering until the tenant is checked again.
+                            $TenantResult.AssignedRoles = $Data.AssignedRoles ?? $Data.GDAPRoles
                             $TenantResult.MissingRoles = $Data.MissingRoles
                             $TenantResult.LastRun = $Data.LastRun
                             $TenantResult.GraphTest = $Data.GraphTest
@@ -71,6 +80,11 @@ function Invoke-ExecAccessChecks {
                             $TenantResult.OrgManagementRoles = $Data.OrgManagementRoles ? @($Data.OrgManagementRoles) : @()
                             $TenantResult.OrgManagementRolesMissing = $Data.OrgManagementRolesMissing ? @($Data.OrgManagementRolesMissing) : @()
                             $TenantResult.OrgManagementRepairNeeded = $Data.OrgManagementRolesMissing.Count -gt 0
+                            # The check reads the account live, so it also backfills direct tenants
+                            # onboarded before the service account was recorded on the tenant.
+                            if ($Data.ServiceAccount) {
+                                $TenantResult.ServiceAccount = $Data.ServiceAccount
+                            }
                         }
                         $TenantResult
                     }
@@ -91,7 +105,7 @@ function Invoke-ExecAccessChecks {
                 }
             }
 
-            if ($Request.Query.SkipCache -eq 'true' -or $Request.Query.SkipCache -eq $true -or $LastRun -lt $4HoursAgo) {
+            if ($SkipCache -or $LastRun -lt $4HoursAgo) {
                 $Message = Test-CIPPAccessTenant -Headers $Request.Headers
             }
 
@@ -103,7 +117,7 @@ function Invoke-ExecAccessChecks {
 
         }
         'GDAP' {
-            if (!$Request.Query.SkipCache -eq 'true' -or !$Request.Query.SkipCache -eq $true) {
+            if (-not $SkipCache) {
                 try {
                     $Cache = Get-CIPPAzDataTableEntity @Table -Filter "RowKey eq 'GDAPRelationships' and Timestamp ge datetime'$TimestampFilter'"
                     $Results = $Cache.Data | ConvertFrom-Json -ErrorAction Stop

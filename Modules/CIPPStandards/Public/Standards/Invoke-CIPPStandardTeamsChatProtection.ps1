@@ -35,18 +35,18 @@ function Invoke-CIPPStandardTeamsChatProtection {
         UPDATECOMMENTBLOCK
             Run the Tools\Update-StandardsComments.ps1 script to update this comment block
     .LINK
-        https://docs.cipp.app/user-documentation/tenant/standards/list-standards
+        https://docs.cipp.app/user-documentation/tenant/standards/alignment/templates/available-standards
     #>
 
     param($Tenant, $Settings)
-    $TestResult = Test-CIPPStandardLicense -StandardName 'TeamsChatProtection' -TenantFilter $Tenant -RequiredCapabilities @('MCOSTANDARD', 'MCOEV', 'MCOIMP', 'TEAMS1', 'Teams_Room_Standard')
+    $TestResult = Test-CIPPStandardLicense -StandardName 'TeamsChatProtection' -TenantFilter $Tenant -Preset Teams
 
     if ($TestResult -eq $false) {
         return $true
     } #we're done.
 
     try {
-        $CurrentState = New-TeamsRequest -TenantFilter $Tenant -Cmdlet 'Get-CsTeamsMessagingConfiguration' | Select-Object -Property Identity, FileTypeCheck, UrlReputationCheck
+        $CurrentState = New-TeamsRequestV2 -TenantFilter $Tenant -Type 'TeamsMessagingConfiguration' -Action Get -Identity 'Global' | Select-Object -Property Identity, FileTypeCheck, UrlReputationCheck
     } catch {
         $ErrorMessage = Get-CippException -Exception $_
         Write-LogMessage -API 'Standards' -Tenant $Tenant -Message "Could not get the Teams Chat Protection state for $Tenant. Error: $($ErrorMessage.NormalizedError)" -Sev Error -LogData $ErrorMessage
@@ -75,7 +75,7 @@ function Invoke-CIPPStandardTeamsChatProtection {
             }
 
             try {
-                $null = New-TeamsRequest -TenantFilter $Tenant -Cmdlet 'Set-CsTeamsMessagingConfiguration' -CmdParams $cmdParams
+                $null = New-TeamsRequestV2 -TenantFilter $Tenant -Type 'TeamsMessagingConfiguration' -Action Set -Parameters $cmdParams
                 Write-LogMessage -API 'Standards' -tenant $Tenant -message "Successfully updated Teams Chat Protection settings to FileTypeCheck: $FileTypeCheckState, UrlReputationCheck: $UrlReputationCheckState" -sev Info
             } catch {
                 $ErrorMessage = Get-CippException -Exception $_

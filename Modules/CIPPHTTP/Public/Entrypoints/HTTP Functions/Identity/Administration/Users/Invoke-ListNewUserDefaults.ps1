@@ -4,6 +4,8 @@ function Invoke-ListNewUserDefaults {
         Entrypoint,AnyTenant
     .ROLE
         Identity.User.Read
+    .DESCRIPTION
+        Lists default templates for new user creation, including default domain, usage location, and license assignments.
     #>
     [CmdletBinding()]
     param($Request, $TriggerMetadata)
@@ -14,7 +16,7 @@ function Invoke-ListNewUserDefaults {
     $TenantFilter = $Request.Query.TenantFilter
 
     # Get the includeAllTenants flag from query or body parameters (defaults to true)
-    $IncludeAllTenants = if ($Request.Query.includeAllTenants -eq 'false' -or $Request.Body.includeAllTenants -eq 'false') {
+    $IncludeAllTenants = if ($Request.Query.includeAllTenants -eq $false -or $Request.Body.includeAllTenants -eq $false) {
         $false
     } else {
         $true

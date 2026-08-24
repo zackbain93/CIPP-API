@@ -12,12 +12,25 @@ function Push-ExecGenerateReportBuilderReport {
         $TemplateName,
         $Blocks,
         $TemplateGUID,
-        $IncludeRawAttachments
+        $IncludeRawAttachments,
+        $Settings
     )
 
     try {
         if ([string]::IsNullOrEmpty($TenantFilter)) {
             throw 'TenantFilter is required'
+        }
+
+        # Page setup and branding for this report — page size, orientation, cover, footer,
+        # watermark and which branding preset to render against. Carried through untouched: the
+        # PDF is rendered in the browser, so this side only has to store what it was given.
+        $ParsedSettings = $null
+        if ($Settings) {
+            if ($Settings -is [string]) {
+                try { $ParsedSettings = ConvertFrom-Json -InputObject $Settings } catch { $ParsedSettings = $null }
+            } else {
+                $ParsedSettings = $Settings
+            }
         }
 
         # Parse Blocks
@@ -34,11 +47,52 @@ function Push-ExecGenerateReportBuilderReport {
             if ($Template -and $Template.JSON) {
                 $TemplateData = ConvertFrom-Json -InputObject $Template.JSON
                 $ParsedBlocks = @($TemplateData.Blocks)
+                # A schedule created before page setup existed passes no Settings, so fall back to
+                # whatever the template itself was saved with.
+                if (-not $ParsedSettings -and $TemplateData.Settings) {
+                    $ParsedSettings = $TemplateData.Settings
+                }
             }
         }
 
         if ($ParsedBlocks.Count -eq 0) {
             throw 'No blocks provided and no template found'
+        }
+
+        # Licence assignments come out of the users cache as objects carrying skuId GUIDs; a
+        # report reader wants product names. The tenant's LicenseOverview cache already carries
+        # the display name per SKU with the ExcludedLicenses table applied, so cells shaped like
+        # licence assignments render through it: known SKUs become their product name and
+        # excluded SKUs drop out, matching every other licence view in CIPP. Without overview
+        # data the cell is left untouched rather than guessed at.
+        $LicenseNamesBySkuId = @{}
+        if ($ParsedBlocks | Where-Object { $_.type -eq 'database' -and $_.dbType }) {
+            try {
+                foreach ($License in @(New-CIPPDbRequest -TenantFilter $TenantFilter -Type 'LicenseOverview' -Fields 'License', 'skuId')) {
+                    if ($License.skuId) { $LicenseNamesBySkuId[([string]$License.skuId).ToLowerInvariant()] = [string]$License.License }
+                }
+            } catch {
+                Write-LogMessage -API 'ReportBuilder' -tenant $TenantFilter -message "Could not load the licence overview cache; licence columns will show raw SKU ids: $($_.Exception.Message)" -Sev 'Warning'
+            }
+        }
+        $ResolveCellValue = {
+            param($Value, $Header, $Row)
+            # Windows 365 Cloud PCs never report BitLocker (isEncrypted stays false) although
+            # their disks are platform-encrypted by Azure - rendered as a distinct state so the
+            # device is not flagged as an encryption risk. Mirrored by the report builder's
+            # client-side preview (formatDatabaseContent).
+            if ($Header -eq 'isEncrypted' -and $Value -ne $true -and $Row -and (Test-CIPPCloudPCDevice -Device $Row)) {
+                return 'Encrypted (platform-managed)'
+            }
+            $Items = @($Value)
+            if ($LicenseNamesBySkuId.Count -eq 0 -or $Items.Count -eq 0 -or $null -eq $Items[0] -or -not $Items[0].PSObject.Properties['skuId']) {
+                return $Value
+            }
+            $Names = foreach ($Assignment in $Items) {
+                $Name = $LicenseNamesBySkuId[([string]$Assignment.skuId).ToLowerInvariant()]
+                if ($Name) { $Name }
+            }
+            return (@($Names) -join ', ')
         }
 
         # For test blocks that are NOT static, fetch fresh test results
@@ -60,8 +114,7 @@ function Push-ExecGenerateReportBuilderReport {
                     if ($TestResult) {
                         if ($TestResult.TestType -eq 'Custom' -and $TestResult.ResultDataJson -and $TestResult.MarkdownTemplate) {
                             $Block.content = $TestResult.MarkdownTemplate
-                        }
-                        if (-not $Block.content -and $TestResult.ResultMarkdown) {
+                        } elseif ($TestResult.ResultMarkdown) {
                             $Block | Add-Member -NotePropertyName 'content' -NotePropertyValue $TestResult.ResultMarkdown -Force
                         }
                     }
@@ -85,7 +138,7 @@ function Push-ExecGenerateReportBuilderReport {
                                     $Obj = [ordered]@{}
                                     foreach ($Header in $SelectedHeaders) {
                                         $Val = $Row.$Header
-                                        $Obj[$Header] = if ($null -ne $Val) { $Val } else { '' }
+                                        $Obj[$Header] = if ($null -ne $Val) { & $ResolveCellValue $Val $Header $Row } else { '' }
                                     }
                                     [PSCustomObject]$Obj
                                 })
@@ -139,6 +192,7 @@ function Push-ExecGenerateReportBuilderReport {
             Blocks       = [string](ConvertTo-Json -InputObject @($EnrichedBlocks) -Depth 20 -Compress)
             GeneratedAt  = [string](Get-Date).ToString('o')
             Status       = 'Completed'
+            Settings     = if ($ParsedSettings) { [string](ConvertTo-Json -InputObject $ParsedSettings -Depth 10 -Compress) } else { '' }
         }
 
         Add-CIPPAzDataTableEntity @ReportTable -Entity $ReportEntity -Force
@@ -184,7 +238,7 @@ function Push-ExecGenerateReportBuilderReport {
                                     $Obj = [ordered]@{}
                                     foreach ($Header in $SelectedHeaders) {
                                         $Val = $Row.$Header
-                                        $Obj[$Header] = if ($null -ne $Val) { $Val } else { '' }
+                                        $Obj[$Header] = if ($null -ne $Val) { & $ResolveCellValue $Val $Header $Row } else { '' }
                                     }
                                     [PSCustomObject]$Obj
                                 })

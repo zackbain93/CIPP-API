@@ -4,13 +4,16 @@ function Invoke-ListLicenses {
         Entrypoint
     .ROLE
         Tenant.Directory.Read
+    .DESCRIPTION
+        Lists Microsoft 365 license SKUs and their assigned/available counts for a tenant. For AllTenants queries, consider using ListDBCache for better performance.
     #>
     [CmdletBinding()]
     param($Request, $TriggerMetadata)
     # Interact with query parameters or the body of the request.
     $TenantFilter = $Request.Query.tenantFilter
+    $IncludeExcluded = $Request.Query.IncludeExcluded -eq $true
     if ($TenantFilter -ne 'AllTenants') {
-        $GraphRequest = Get-CIPPLicenseOverview -TenantFilter $TenantFilter | ForEach-Object {
+        $GraphRequest = Get-CIPPLicenseOverview -TenantFilter $TenantFilter -IncludeExcluded:$IncludeExcluded | ForEach-Object {
             $_
         }
     } else {
@@ -36,7 +39,7 @@ function Invoke-ListLicenses {
                 Write-Host "Started permissions orchestration with ID = '$InstanceId'"
             }
         } else {
-            $GraphRequest = $Rows | ForEach-Object {
+            $GraphRequest = $Rows | Select-CippAllowedTenantData -TenantProperty 'Tenant' | ForEach-Object {
                 $LicenseData = $_.License | ConvertFrom-Json -ErrorAction SilentlyContinue
                 foreach ($License in $LicenseData) {
                     $License

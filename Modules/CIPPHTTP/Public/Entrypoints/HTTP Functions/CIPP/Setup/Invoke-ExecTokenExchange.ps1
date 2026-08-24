@@ -9,7 +9,7 @@ function Invoke-ExecTokenExchange {
     param($Request, $TriggerMetadata)
 
     # Get the key vault name
-    $KV = $env:WEBSITE_DEPLOYMENT_ID
+    $KV = Get-CippKeyVaultName
     $APIName = $Request.Params.CIPPEndpoint
 
     try {
@@ -25,6 +25,15 @@ function Invoke-ExecTokenExchange {
         if (!$TokenRequest -or !$TokenUrl) {
             Write-LogMessage -API $APIName -message 'Missing required parameters: tokenRequest or tokenUrl' -Sev 'Error'
             throw 'Missing required parameters: tokenRequest or tokenUrl'
+        }
+
+        $ParsedTokenUri = $null
+        $IsValidTokenUri = [System.Uri]::TryCreate($TokenUrl, [System.UriKind]::Absolute, [ref]$ParsedTokenUri)
+        if (-not $IsValidTokenUri -or
+            -not $ParsedTokenUri.Scheme.Equals('https', [System.StringComparison]::OrdinalIgnoreCase) -or
+            -not $ParsedTokenUri.Host.Equals('login.microsoftonline.com', [System.StringComparison]::OrdinalIgnoreCase)) {
+            Write-LogMessage -API $APIName -message "Blocked token request to non-Microsoft login host: $TokenUrl" -Sev 'Warning'
+            throw 'Invalid tokenUrl. Only https://login.microsoftonline.com is allowed.'
         }
 
         Write-LogMessage -API $APIName -message "Making token request to $TokenUrl" -Sev 'Info'
@@ -68,7 +77,6 @@ function Invoke-ExecTokenExchange {
             $FormData['client_secret'] = $ClientSecret
         }
 
-        Write-Host "Posting this data: $($FormData | ConvertTo-Json -Depth 15)"
         $Results = Invoke-RestMethod -Uri $TokenUrl -Method Post -Body $FormData -ContentType 'application/x-www-form-urlencoded' -ErrorAction Stop -SkipHttpErrorCheck
     } catch {
         $ErrorMessage = $_.Exception

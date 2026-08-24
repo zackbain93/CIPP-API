@@ -1,7 +1,7 @@
 function Invoke-ExecDnsConfig {
     <#
     .FUNCTIONALITY
-        Entrypoint
+        Entrypoint, AnyTenant
     .ROLE
         Tenant.Domains.ReadWrite
     #>
@@ -69,6 +69,13 @@ function Invoke-ExecDnsConfig {
                 $DomainTable = Get-CIPPTable -Table 'Domains'
                 $Filter = "RowKey eq '{0}'" -f $Domain
                 $DomainInfo = Get-CIPPAzDataTableEntity @DomainTable -Filter $Filter
+
+                # AnyTenant: restricted callers may only edit domains for tenants in scope
+                $AllowedTenants = Test-CIPPAccess -Request $Request -TenantList
+                if ($AllowedTenants -notcontains 'AllTenants' -and -not ($DomainInfo | Select-CippAllowedTenantData -TenantProperty 'TenantGUID', 'TenantId')) {
+                    throw 'Access to this domain is not allowed'
+                }
+
                 $DkimSelectors = [string]($Selector | ConvertTo-Json -Compress)
                 if ($DomainInfo) {
                     $DomainInfo.DkimSelectors = $DkimSelectors
@@ -93,8 +100,15 @@ function Invoke-ExecDnsConfig {
             }
             'RemoveDomain' {
                 $Filter = "RowKey eq '{0}'" -f $Domain
-                $DomainRow = Get-CIPPAzDataTableEntity @DomainTable -Filter $Filter -Property PartitionKey, RowKey
-                Remove-AzDataTableEntity -Force @DomainTable -Entity $DomainRow
+                $DomainRow = Get-CIPPAzDataTableEntity @DomainTable -Filter $Filter -Property PartitionKey, RowKey, TenantGUID, TenantId
+
+                # AnyTenant: restricted callers may only remove domains for tenants in scope
+                $AllowedTenants = Test-CIPPAccess -Request $Request -TenantList
+                if ($AllowedTenants -notcontains 'AllTenants' -and -not ($DomainRow | Select-CippAllowedTenantData -TenantProperty 'TenantGUID', 'TenantId')) {
+                    throw 'Access to this domain is not allowed'
+                }
+
+                Remove-CIPPAzDataTableEntity -Force @DomainTable -Entity $DomainRow
                 Write-LogMessage -API $APIName -tenant 'Global' -headers $Headers -message "Removed Domain - $Domain " -Sev 'Info'
                 $body = [pscustomobject]@{ 'Results' = "Domain removed - $Domain" }
             }

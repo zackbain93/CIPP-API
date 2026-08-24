@@ -4,6 +4,8 @@ function Invoke-ListMailQuarantineMessage {
         Entrypoint
     .ROLE
         Exchange.SpamFilter.Read
+    .DESCRIPTION
+        Exports and retrieves the raw EML content of a specific quarantined email message by its Identity.
     #>
     [CmdletBinding()]
     param($Request, $TriggerMetadata)
@@ -16,8 +18,9 @@ function Invoke-ListMailQuarantineMessage {
         $EmlBase64 = $GraphRequest.Eml
         $EmlContent = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($EmlBase64))
         $Body = @{
-            'Identity' = $Identity
-            'Message'  = $EmlContent
+            'Identity'  = $Identity
+            'Message'   = $EmlContent
+            'EmlBase64' = $EmlBase64
         }
         $StatusCode = [HttpStatusCode]::OK
     } catch {

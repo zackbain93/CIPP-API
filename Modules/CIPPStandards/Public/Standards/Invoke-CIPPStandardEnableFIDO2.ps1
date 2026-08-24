@@ -40,7 +40,7 @@ function Invoke-CIPPStandardEnableFIDO2 {
         UPDATECOMMENTBLOCK
             Run the Tools\Update-StandardsComments.ps1 script to update this comment block
     .LINK
-        https://docs.cipp.app/user-documentation/tenant/standards/list-standards
+        https://docs.cipp.app/user-documentation/tenant/standards/alignment/templates/available-standards
     #>
 
     param($Tenant, $Settings)
@@ -61,6 +61,8 @@ function Invoke-CIPPStandardEnableFIDO2 {
             try {
                 Set-CIPPAuthenticationPolicy -Tenant $tenant -APIName 'Standards' -AuthenticationMethodId 'Fido2' -Enabled $true
             } catch {
+                $ErrorMessage = Get-CippException -Exception $_
+                Write-LogMessage -API 'Standards' -tenant $tenant -message "Failed to enable FIDO2 Support. Error: $($ErrorMessage.NormalizedError)" -sev Error -LogData $ErrorMessage
             }
         }
     }

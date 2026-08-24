@@ -10,12 +10,14 @@ function Start-AuditLogSearchCreation {
     param()
     try {
         $ConfigTable = Get-CippTable -TableName 'WebhookRules'
-        $ConfigEntries = Get-CIPPAzDataTableEntity @ConfigTable -Filter "PartitionKey eq 'Webhookv2'" | ForEach-Object {
+        $ConfigEntries = Get-CIPPAzDataTableEntity @ConfigTable -Filter "PartitionKey eq 'Webhookv2'" | Where-Object { $_.Disabled -ne $true } | ForEach-Object {
             $ConfigEntry = $_
             if (!$ConfigEntry.excludedTenants) {
                 $ConfigEntry | Add-Member -MemberType NoteProperty -Name 'excludedTenants' -Value @() -Force
             } else {
-                $ConfigEntry.excludedTenants = $ConfigEntry.excludedTenants | ConvertFrom-Json
+                # Expand tenant groups in exclusions so group members match on defaultDomainName
+                $Excluded = $ConfigEntry.excludedTenants | ConvertFrom-Json -ErrorAction SilentlyContinue
+                $ConfigEntry.excludedTenants = if ($Excluded) { @(Expand-CIPPTenantGroups -TenantFilter $Excluded) } else { @() }
             }
             $ConfigEntry.Tenants = $ConfigEntry.Tenants | ConvertFrom-Json
             $ConfigEntry
@@ -44,7 +46,7 @@ function Start-AuditLogSearchCreation {
         }
 
         if ($ExpiredDisabledRows.Count -gt 0) {
-            Remove-AzDataTableEntity @AuditDisabledTable -Entity $ExpiredDisabledRows -Force | Out-Null
+            Remove-CIPPAzDataTableEntity @AuditDisabledTable -Entity $ExpiredDisabledRows -Force | Out-Null
         }
 
         # Round time down to nearest minute

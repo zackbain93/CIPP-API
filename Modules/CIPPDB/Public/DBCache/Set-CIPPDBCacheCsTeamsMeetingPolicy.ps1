@@ -4,7 +4,7 @@ function Set-CIPPDBCacheCsTeamsMeetingPolicy {
         Caches the Teams Global Meeting Policy
 
     .DESCRIPTION
-        Calls Get-CsTeamsMeetingPolicy via New-TeamsRequest and writes the
+        Calls Get-CsTeamsMeetingPolicy via New-TeamsRequestV2 and writes the
         result into the CippReportingDB under Type 'CsTeamsMeetingPolicy'.
         Used by CIS tests 8.5.1 - 8.5.9.
 
@@ -24,12 +24,11 @@ function Set-CIPPDBCacheCsTeamsMeetingPolicy {
     try {
         Write-LogMessage -API 'CIPPDBCache' -tenant $TenantFilter -message 'Caching Teams Meeting Policy' -sev Debug
 
-        $MeetingPolicy = New-TeamsRequest -TenantFilter $TenantFilter -Cmdlet 'Get-CsTeamsMeetingPolicy' -CmdParams @{ Identity = 'Global' }
+        $MeetingPolicy = New-TeamsRequestV2 -TenantFilter $TenantFilter -Type 'TeamsMeetingPolicy' -Action Get -Identity 'Global'
 
         if ($MeetingPolicy) {
             $Data = @($MeetingPolicy)
-            Add-CIPPDbItem -TenantFilter $TenantFilter -Type 'CsTeamsMeetingPolicy' -Data $Data
-            Add-CIPPDbItem -TenantFilter $TenantFilter -Type 'CsTeamsMeetingPolicy' -Data $Data -Count
+            Add-CIPPDbItem -TenantFilter $TenantFilter -Type 'CsTeamsMeetingPolicy' -Data $Data -AddCount
             Write-LogMessage -API 'CIPPDBCache' -tenant $TenantFilter -message 'Cached Teams Meeting Policy' -sev Debug
         }
         $MeetingPolicy = $null

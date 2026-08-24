@@ -38,6 +38,12 @@ function New-CIPPCATemplate {
         }
     }
 
+    # Fetch authentication context class references if the policy uses them
+    $authContexts = $null
+    if ($JSON.conditions.applications.includeAuthenticationContextClassReferences) {
+        $authContexts = New-GraphGetRequest -uri 'https://graph.microsoft.com/beta/identity/conditionalAccess/authenticationContextClassReferences' -tenantid $TenantFilter
+    }
+
     $AllLocations = [system.collections.generic.list[object]]::new()
 
     $includelocations = [system.collections.generic.list[object]]::new()
@@ -70,7 +76,7 @@ function New-CIPPCATemplate {
     if ($isPSCustomObject -and $hasIncludeUsers) {
         $JSON.conditions.users.includeUsers = @($JSON.conditions.users.includeUsers | ForEach-Object {
                 $originalID = $_
-                if ($_ -in 'All', 'None', 'GuestOrExternalUsers') { return $_ }
+                if ($_ -in 'All', 'None', 'GuestsOrExternalUsers') { return $_ }
                 $match = $users | Where-Object { $_.id -eq $originalID }
                 if ($match) { $match.displayName } else { $originalID }
             })
@@ -79,7 +85,7 @@ function New-CIPPCATemplate {
     # Use the same type check for other user properties
     if ($isPSCustomObject -and $null -ne $JSON.conditions.users.excludeUsers) {
         $JSON.conditions.users.excludeUsers = @($JSON.conditions.users.excludeUsers | ForEach-Object {
-                if ($_ -in 'All', 'None', 'GuestOrExternalUsers') { return $_ }
+                if ($_ -in 'All', 'None', 'GuestsOrExternalUsers') { return $_ }
                 $originalID = $_
                 $match = $users | Where-Object { $_.id -eq $originalID }
                 if ($match) { $match.displayName } else { $originalID }
@@ -89,7 +95,7 @@ function New-CIPPCATemplate {
     if ($isPSCustomObject -and $null -ne $JSON.conditions.users.includeGroups) {
         $JSON.conditions.users.includeGroups = @($JSON.conditions.users.includeGroups | ForEach-Object {
                 $originalID = $_
-                if ($_ -in 'All', 'None', 'GuestOrExternalUsers' -or -not (Test-IsGuid -String $_)) { return $_ }
+                if ($_ -in 'All', 'None', 'GuestsOrExternalUsers' -or -not (Test-IsGuid -String $_)) { return $_ }
                 $match = $groups | Where-Object { $_.id -eq $originalID }
                 if ($match) { $match.displayName } else { $originalID }
             })
@@ -97,7 +103,7 @@ function New-CIPPCATemplate {
     if ($isPSCustomObject -and $null -ne $JSON.conditions.users.excludeGroups) {
         $JSON.conditions.users.excludeGroups = @($JSON.conditions.users.excludeGroups | ForEach-Object {
                 $originalID = $_
-                if ($_ -in 'All', 'None', 'GuestOrExternalUsers' -or -not (Test-IsGuid -String $_)) { return $_ }
+                if ($_ -in 'All', 'None', 'GuestsOrExternalUsers' -or -not (Test-IsGuid -String $_)) { return $_ }
                 $match = $groups | Where-Object { $_.id -eq $originalID }
                 if ($match) { $match.displayName } else { $originalID }
             })
@@ -113,6 +119,24 @@ function New-CIPPCATemplate {
     # Remove duplicates based on displayName to avoid Select-Object -Unique issues with complex objects
     $UniqueLocations = $AllLocations | Group-Object -Property displayName | ForEach-Object { $_.Group[0] }
     $JSON | Add-Member -NotePropertyName 'LocationInfo' -NotePropertyValue @($UniqueLocations) -Force
+
+    # Convert authentication context class reference IDs to display names and store full objects
+    if ($authContexts -and $JSON.conditions.applications.includeAuthenticationContextClassReferences) {
+        $AllAuthContexts = [System.Collections.Generic.List[object]]::new()
+        $authContextDisplayNames = [System.Collections.Generic.List[object]]::new()
+        foreach ($acr in $JSON.conditions.applications.includeAuthenticationContextClassReferences) {
+            $acrInfo = $authContexts | Where-Object -Property id -EQ $acr | Select-Object id, displayName, description, isAvailable
+            if ($acrInfo) {
+                $authContextDisplayNames.Add($acrInfo.displayName)
+                $AllAuthContexts.Add($acrInfo)
+            } else {
+                $authContextDisplayNames.Add($acr)
+            }
+        }
+        $JSON.conditions.applications.includeAuthenticationContextClassReferences = @($authContextDisplayNames)
+        $JSON | Add-Member -NotePropertyName 'AuthContextInfo' -NotePropertyValue @($AllAuthContexts) -Force
+    }
+
     $JSON = (ConvertTo-Json -Compress -Depth 100 -InputObject $JSON)
     return $JSON
 }

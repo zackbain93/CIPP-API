@@ -30,7 +30,7 @@ function Invoke-CIPPStandardAppManagementPolicy {
         UPDATECOMMENTBLOCK
             Run the Tools\Update-StandardsComments.ps1 script to update this comment block
     .LINK
-        https://docs.cipp.app/user-documentation/tenant/standards/list-standards
+        https://docs.cipp.app/user-documentation/tenant/standards/alignment/templates/available-standards
     #>
 
     param($Tenant, $Settings)
@@ -137,16 +137,21 @@ function Invoke-CIPPStandardAppManagementPolicy {
         }
     }
 
+    # Project current policy restrictions down to only the fields this standard manages.
+    # Graph adds new properties to restriction objects over time (e.g. excludeActors, returned as null)
+    # which would otherwise cause a permanent deviation in the JSON comparison below.
+    $ManagedRestrictionFields = 'restrictionType', 'state', 'maxLifetime', 'restrictForAppsCreatedAfterDateTime'
+
     # Sort current policy arrays the same way for consistent comparison
     $CurrentValue = [PSCustomObject]@{
         isEnabled                   = [bool]$CurrentPolicy.isEnabled
         applicationRestrictions     = [PSCustomObject]@{
-            passwordCredentials = @($CurrentPolicy.applicationRestrictions.passwordCredentials | Sort-Object -Property restrictionType)
-            keyCredentials      = @($CurrentPolicy.applicationRestrictions.keyCredentials | Sort-Object -Property restrictionType)
+            passwordCredentials = @($CurrentPolicy.applicationRestrictions.passwordCredentials | Select-Object -Property $ManagedRestrictionFields | Sort-Object -Property restrictionType)
+            keyCredentials      = @($CurrentPolicy.applicationRestrictions.keyCredentials | Select-Object -Property $ManagedRestrictionFields | Sort-Object -Property restrictionType)
         }
         servicePrincipalRestrictions = [PSCustomObject]@{
-            passwordCredentials = @($CurrentPolicy.servicePrincipalRestrictions.passwordCredentials | Sort-Object -Property restrictionType)
-            keyCredentials      = @($CurrentPolicy.servicePrincipalRestrictions.keyCredentials | Sort-Object -Property restrictionType)
+            passwordCredentials = @($CurrentPolicy.servicePrincipalRestrictions.passwordCredentials | Select-Object -Property $ManagedRestrictionFields | Sort-Object -Property restrictionType)
+            keyCredentials      = @($CurrentPolicy.servicePrincipalRestrictions.keyCredentials | Select-Object -Property $ManagedRestrictionFields | Sort-Object -Property restrictionType)
         }
     }
 
