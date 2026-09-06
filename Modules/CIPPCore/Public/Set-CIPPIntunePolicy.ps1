@@ -8,77 +8,157 @@ function Set-CIPPIntunePolicy {
         $AssignTo,
         $ExcludeGroup,
         $Headers,
-        $APINAME,
-        $tenantFilter
+        $APIName = 'Set-CIPPIntunePolicy',
+        $TenantFilter,
+        $AssignmentFilterName,
+        $AssignmentFilterType = 'include',
+        [array]$ReusableSettings,
+        [int]$LevenshteinDistance = 0,
+        # 'append' (default) adds the requested assignments and leaves everything else in place.
+        # 'replace' makes the policy's assignments exactly what was requested - used by callers that
+        # own the assignment, so that a comparison demanding an exact set is actually satisfiable.
+        [ValidateSet('append', 'replace')]
+        [string]$AssignmentMode = 'append'
     )
-    $APINAME = 'Set-CIPPIntunePolicy'
 
-    $RawJSON = Get-CIPPTextReplacement -TenantFilter $tenantFilter -Text $RawJSON
+    $RawJSON = Get-CIPPTextReplacement -TenantFilter $TenantFilter -Text $RawJSON -EscapeForJson
+
+    if ($LevenshteinDistance -gt 5) {
+        Write-LogMessage -headers $Headers -API $APIName -tenant $TenantFilter -message "LevenshteinDistance is set to $LevenshteinDistance. Values above 5 can match unrelated policies; use with caution." -Sev Warning
+    }
 
     try {
+        if ([string]::IsNullOrWhiteSpace($RawJSON)) {
+            throw "The template contains no policy JSON (RAWJson is empty). The stored template row is corrupt, or a same-named duplicate row shadowed the one selected. Delete the broken copy of this template and recreate it."
+        }
+        # Tenants with Intune multi-admin approval reject policy writes outright unless a
+        # justification header rides along; with it, the write either applies directly or
+        # lands as an approval request for another admin to action. Harmless on tenants
+        # without approval enabled.
+        $ApprovalHeaders = @{ 'x-msft-approval-justification' = 'CIPP policy deployment: apply the selected template.' }
         switch ($TemplateType) {
             'AppProtection' {
                 $PlatformType = 'deviceAppManagement'
-                $TemplateType = ($RawJSON | ConvertFrom-Json).'@odata.type' -replace '#microsoft.graph.', ''
                 $PolicyFile = $RawJSON | ConvertFrom-Json
-                $Null = $PolicyFile | Add-Member -MemberType NoteProperty -Name 'description' -Value $description -Force
-                $null = $PolicyFile | Add-Member -MemberType NoteProperty -Name 'displayName' -Value $displayname -Force
-                $PolicyFile = $PolicyFile | Select-Object * -ExcludeProperty 'apps'
+                $TemplateTypeURL = Get-CIPPAppProtectionPolicyUrl -Policy $PolicyFile
+                if (-not $TemplateTypeURL) {
+                    throw "App Protection template '$DisplayName' identifies no platform - it carries no @odata.type, no @odata.context and no platform-specific settings - so the policy type cannot be determined. Recreate the template or re-run the template sync."
+                }
+                $Null = $PolicyFile | Add-Member -MemberType NoteProperty -Name 'description' -Value $Description -Force
+                $null = $PolicyFile | Add-Member -MemberType NoteProperty -Name 'displayName' -Value $DisplayName -Force
+                # Read-only properties Graph echoes back on a GET. They are carried in the template
+                # because the capture keeps the payload whole, and Graph rejects them on the way in.
+                $PolicyFile = $PolicyFile | Select-Object * -ExcludeProperty 'apps', id, createdDateTime, lastModifiedDateTime, version, '@odata.context', isAssigned, deployedAppCount
                 $RawJSON = ConvertTo-Json -InputObject $PolicyFile -Depth 20
-                $TemplateTypeURL = if ($TemplateType -eq 'windowsInformationProtectionPolicy') { 'windowsInformationProtectionPolicies' } else { "$($TemplateType)s" }
-                $CheckExististing = New-GraphGETRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL" -tenantid $tenantFilter
-                if ($displayname -in $CheckExististing.displayName) {
+                $CheckExististing = New-GraphGETRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL" -tenantid $TenantFilter
+                $FuzzyResult = Find-CIPPFuzzyPolicyMatch -DisplayName $DisplayName -ExistingPolicies $CheckExististing -MaxDistance $LevenshteinDistance
+                if ($FuzzyResult) {
                     $PostType = 'edited'
-                    $ExistingID = $CheckExististing | Where-Object -Property displayName -EQ $displayname
-                    $CreateRequest = New-GraphPOSTRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL/$($ExistingID.Id)" -tenantid $tenantFilter -type PATCH -body $RawJSON
-                    $CreateRequest = $CheckExististing | Where-Object -Property displayName -EQ $DisplayName
+                    $ExistingID = $FuzzyResult.Policy
+                    if ($FuzzyResult.MatchType -eq 'fuzzy') {
+                        Write-LogMessage -headers $Headers -API $APIName -tenant $TenantFilter -message "Fuzzy matched policy '$($FuzzyResult.OriginalName)' for template '$DisplayName' (distance=$($FuzzyResult.Distance))" -Sev Info
+                    }
+                    $CreateRequest = New-GraphPOSTRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL/$($ExistingID.Id)" -tenantid $TenantFilter -type PATCH -body $RawJSON -AddedHeaders $ApprovalHeaders
+                    $CreateRequest = $FuzzyResult.Policy
                 } else {
                     $PostType = 'added'
-                    $CreateRequest = New-GraphPOSTRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL" -tenantid $tenantFilter -type POST -body $RawJSON
+                    $CreateRequest = New-GraphPOSTRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL" -tenantid $TenantFilter -type POST -body $RawJSON -AddedHeaders $ApprovalHeaders
+                }
+            }
+            'AppConfiguration' {
+                $PlatformType = 'deviceAppManagement'
+                $TemplateTypeURL = 'mobileAppConfigurations'
+                $PolicyFile = $RawJSON | ConvertFrom-Json
+                $Null = $PolicyFile | Add-Member -MemberType NoteProperty -Name 'description' -Value $Description -Force
+                $null = $PolicyFile | Add-Member -MemberType NoteProperty -Name 'displayName' -Value $DisplayName -Force
+                $CheckExististing = New-GraphGETRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL" -tenantid $TenantFilter
+                $FuzzyResult = Find-CIPPFuzzyPolicyMatch -DisplayName $DisplayName -ExistingPolicies $CheckExististing -MaxDistance $LevenshteinDistance
+                if ($FuzzyResult) {
+                    $PostType = 'edited'
+                    $ExistingID = $FuzzyResult.Policy
+                    if ($FuzzyResult.MatchType -eq 'fuzzy') {
+                        Write-LogMessage -headers $Headers -API $APIName -tenant $TenantFilter -message "Fuzzy matched policy '$($FuzzyResult.OriginalName)' for template '$DisplayName' (distance=$($FuzzyResult.Distance))" -Sev Info
+                    }
+                    $PolicyFile = $PolicyFile | Select-Object * -ExcludeProperty id, createdDateTime, lastModifiedDateTime, version, '@odata.context', targetedMobileApps, targetedMobileAppsDetails
+                    $RawJSON = ConvertTo-Json -InputObject $PolicyFile -Depth 20 -Compress
+                    $CreateRequest = New-GraphPOSTRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL/$($ExistingID.Id)" -tenantid $TenantFilter -type PATCH -body $RawJSON -AddedHeaders $ApprovalHeaders
+                    Write-LogMessage -headers $Headers -API $APIName -tenant $($TenantFilter) -message "Updated policy $($DisplayName) to template defaults" -Sev Info
+                    $CreateRequest = $FuzzyResult.Policy
+                } else {
+                    $PostType = 'added'
+                    # The template's targetedMobileApps are ids from the tenant it was captured in.
+                    # Resolve them to this tenant's apps (or fail with the app named) before creating.
+                    $ResolvedApps = @(Resolve-CIPPIntuneTargetedMobileApps -PolicyFile $PolicyFile -TenantFilter $TenantFilter -Headers $Headers -APIName $APIName)
+                    $PolicyFile = $PolicyFile | Select-Object * -ExcludeProperty id, createdDateTime, lastModifiedDateTime, version, '@odata.context', targetedMobileAppsDetails
+                    if ($ResolvedApps.Count -gt 0 -or $PolicyFile.PSObject.Properties['targetedMobileApps']) {
+                        $PolicyFile | Add-Member -NotePropertyName 'targetedMobileApps' -NotePropertyValue @($ResolvedApps) -Force
+                    }
+                    $RawJSON = ConvertTo-Json -InputObject $PolicyFile -Depth 20 -Compress
+                    $CreateRequest = New-GraphPOSTRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL" -tenantid $TenantFilter -type POST -body $RawJSON -AddedHeaders $ApprovalHeaders
+                    Write-LogMessage -headers $Headers -API $APIName -tenant $($TenantFilter) -message "Added policy $($DisplayName) via template" -Sev Info
                 }
             }
             'deviceCompliancePolicies' {
                 $PlatformType = 'deviceManagement'
                 $TemplateTypeURL = 'deviceCompliancePolicies'
-                $CheckExististing = New-GraphGETRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL" -tenantid $tenantFilter
-                $JSON = $RawJSON | ConvertFrom-Json | Select-Object * -ExcludeProperty id, createdDateTime, lastModifiedDateTime, version, 'scheduledActionsForRule@odata.context', '@odata.context'
-                $JSON.scheduledActionsForRule = @($JSON.scheduledActionsForRule | Select-Object * -ExcludeProperty 'scheduledActionConfigurations@odata.context')
-                if ($displayname -in $CheckExististing.displayName) {
-                    $RawJSON = ConvertTo-Json -InputObject ($JSON | Select-Object * -ExcludeProperty 'scheduledActionsForRule') -Depth 20 -Compress
+                $CheckExististing = New-GraphGETRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL" -tenantid $TenantFilter
+                $PolicyFile = $RawJSON | ConvertFrom-Json | Select-Object * -ExcludeProperty id, createdDateTime, lastModifiedDateTime, version, 'scheduledActionsForRule@odata.context', '@odata.context'
+                $PolicyFile.scheduledActionsForRule = @($PolicyFile.scheduledActionsForRule | Select-Object * -ExcludeProperty 'scheduledActionConfigurations@odata.context')
+                $Null = $PolicyFile | Add-Member -MemberType NoteProperty -Name 'description' -Value $Description -Force
+                $null = $PolicyFile | Add-Member -MemberType NoteProperty -Name 'displayName' -Value $DisplayName -Force
+                $ComplianceODataType = ($RawJSON | ConvertFrom-Json).'@odata.type'
+                $FuzzyResult = Find-CIPPFuzzyPolicyMatch -DisplayName $DisplayName -ExistingPolicies $CheckExististing -MaxDistance $LevenshteinDistance -ODataType $ComplianceODataType
+                if ($FuzzyResult) {
+                    $EditPolicy = $PolicyFile | Select-Object * -ExcludeProperty 'scheduledActionsForRule'
+                    # deviceCompliancePolicies is a polymorphic collection with an abstract base type. A PATCH
+                    # carrying derived-type properties (osMinimumVersion, workProfile*, ...) with no @odata.type
+                    # fails Graph model validation. Templates imported or captured without it (RAWJson has no
+                    # @odata.type) hit this, so borrow the concrete type from the matched policy.
+                    if (-not $EditPolicy.'@odata.type' -and $FuzzyResult.Policy.'@odata.type') {
+                        $null = $EditPolicy | Add-Member -MemberType NoteProperty -Name '@odata.type' -Value $FuzzyResult.Policy.'@odata.type' -Force
+                    }
+                    $RawJSON = ConvertTo-Json -InputObject $EditPolicy -Depth 20 -Compress
                     $PostType = 'edited'
-                    $ExistingID = $CheckExististing | Where-Object -Property displayName -EQ $displayname
-                    $CreateRequest = New-GraphPOSTRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL/$($ExistingID.Id)" -tenantid $tenantFilter -type PATCH -body $RawJSON
-                    Write-LogMessage -headers $Headers -API $APINAME -tenant $($tenantFilter) -message "Updated policy $($DisplayName) to template defaults" -Sev 'info'
-                    $CreateRequest = $CheckExististing | Where-Object -Property displayName -EQ $DisplayName
+                    $ExistingID = $FuzzyResult.Policy
+                    if ($FuzzyResult.MatchType -eq 'fuzzy') {
+                        Write-LogMessage -headers $Headers -API $APIName -tenant $TenantFilter -message "Fuzzy matched policy '$($FuzzyResult.OriginalName)' for template '$DisplayName' (distance=$($FuzzyResult.Distance))" -Sev Info
+                    }
+                    $CreateRequest = New-GraphPOSTRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL/$($ExistingID.Id)" -tenantid $TenantFilter -type PATCH -body $RawJSON -AddedHeaders $ApprovalHeaders
+                    Write-LogMessage -headers $Headers -API $APIName -tenant $($TenantFilter) -message "Updated policy $($DisplayName) to template defaults" -Sev Info
+                    $CreateRequest = $FuzzyResult.Policy
                 } else {
-                    $RawJSON = ConvertTo-Json -InputObject $JSON -Depth 20 -Compress
+                    $RawJSON = ConvertTo-Json -InputObject $PolicyFile -Depth 20 -Compress
                     $PostType = 'added'
-                    $CreateRequest = New-GraphPOSTRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL" -tenantid $tenantFilter -type POST -body $RawJSON
-                    Write-LogMessage -headers $Headers -API $APINAME -tenant $($tenantFilter) -message "Added policy $($DisplayName) via template" -Sev 'info'
+                    $CreateRequest = New-GraphPOSTRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL" -tenantid $TenantFilter -type POST -body $RawJSON -AddedHeaders $ApprovalHeaders
+                    Write-LogMessage -headers $Headers -API $APIName -tenant $($TenantFilter) -message "Added policy $($DisplayName) via template" -Sev Info
                 }
             }
             'Admin' {
                 $PlatformType = 'deviceManagement'
                 $TemplateTypeURL = 'groupPolicyConfigurations'
-                $CreateBody = '{"description":"' + $description + '","displayName":"' + $displayname + '","roleScopeTagIds":["0"]}'
-                $CheckExististing = New-GraphGETRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL" -tenantid $tenantFilter
-                if ($displayname -in $CheckExististing.displayName) {
-                    $ExistingID = $CheckExististing | Where-Object -Property displayName -EQ $displayname
-                    $ExistingData = New-GraphGETRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL('$($ExistingID.id)')/definitionValues" -tenantid $tenantFilter
+                $CreateBody = '{"description":"' + $Description + '","displayName":"' + $DisplayName + '","roleScopeTagIds":["0"]}'
+                $CheckExististing = New-GraphGETRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL" -tenantid $TenantFilter
+                $FuzzyResult = Find-CIPPFuzzyPolicyMatch -DisplayName $DisplayName -ExistingPolicies $CheckExististing -MaxDistance $LevenshteinDistance
+                if ($FuzzyResult) {
+                    $ExistingID = $FuzzyResult.Policy
+                    if ($FuzzyResult.MatchType -eq 'fuzzy') {
+                        Write-LogMessage -headers $Headers -API $APIName -tenant $TenantFilter -message "Fuzzy matched policy '$($FuzzyResult.OriginalName)' for template '$DisplayName' (distance=$($FuzzyResult.Distance))" -Sev Info
+                    }
+                    $ExistingData = New-GraphGETRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL('$($ExistingID.id)')/definitionValues" -tenantid $TenantFilter
                     $DeleteJson = $RawJSON | ConvertFrom-Json -Depth 10
                     $DeleteJson | Add-Member -MemberType NoteProperty -Name 'deletedIds' -Value @($ExistingData.id) -Force
                     $DeleteJson | Add-Member -MemberType NoteProperty -Name 'added' -Value @() -Force
                     $DeleteJson = ConvertTo-Json -Depth 10 -InputObject $DeleteJson
-                    $DeleteRequest = New-GraphPOSTRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL('$($ExistingID.id)')/updateDefinitionValues" -tenantid $tenantFilter -type POST -body $DeleteJson
-                    $CreateRequest = New-GraphPOSTRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL('$($ExistingID.id)')/updateDefinitionValues" -tenantid $tenantFilter -type POST -body $RawJSON
-                    $CreateRequest = $CheckExististing | Where-Object -Property displayName -EQ $DisplayName
-                    Write-LogMessage -headers $Headers -API $APINAME -tenant $($tenantFilter) -message "Updated policy $($Displayname) to template defaults" -Sev 'info'
+                    $DeleteRequest = New-GraphPOSTRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL('$($ExistingID.id)')/updateDefinitionValues" -tenantid $TenantFilter -type POST -body $DeleteJson -AddedHeaders $ApprovalHeaders
+                    $CreateRequest = New-GraphPOSTRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL('$($ExistingID.id)')/updateDefinitionValues" -tenantid $TenantFilter -type POST -body $RawJSON -AddedHeaders $ApprovalHeaders
+                    $CreateRequest = $FuzzyResult.Policy
+                    Write-LogMessage -headers $Headers -API $APIName -tenant $($TenantFilter) -message "Updated policy $($DisplayName) to template defaults" -Sev Info
                     $PostType = 'edited'
                 } else {
                     $PostType = 'added'
-                    $CreateRequest = New-GraphPOSTRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL" -tenantid $tenantFilter -type POST -body $CreateBody
-                    $UpdateRequest = New-GraphPOSTRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL('$($CreateRequest.id)')/updateDefinitionValues" -tenantid $tenantFilter -type POST -body $RawJSON
-                    Write-LogMessage -headers $Headers -API $APINAME -tenant $($tenantFilter) -message "Added policy $($Displayname) to template defaults" -Sev 'info'
+                    $CreateRequest = New-GraphPOSTRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL" -tenantid $TenantFilter -type POST -body $CreateBody -AddedHeaders $ApprovalHeaders
+                    $UpdateRequest = New-GraphPOSTRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL('$($CreateRequest.id)')/updateDefinitionValues" -tenantid $TenantFilter -type POST -body $RawJSON -AddedHeaders $ApprovalHeaders
+                    Write-LogMessage -headers $Headers -API $APIName -tenant $($TenantFilter) -message "Added policy $($DisplayName) to template defaults" -Sev Info
 
                 }
             }
@@ -86,136 +166,227 @@ function Set-CIPPIntunePolicy {
                 $PlatformType = 'deviceManagement'
                 $TemplateTypeURL = 'deviceConfigurations'
                 $PolicyFile = $RawJSON | ConvertFrom-Json
-                $Null = $PolicyFile | Add-Member -MemberType NoteProperty -Name 'description' -Value "$description" -Force
-                $null = $PolicyFile | Add-Member -MemberType NoteProperty -Name 'displayName' -Value $displayname -Force
-                $CheckExististing = New-GraphGETRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL" -tenantid $tenantFilter
-                $ExistingID = $CheckExististing | Where-Object -Property displayName -EQ $DisplayName | Select-Object -Last 1
+                if ([string]::IsNullOrWhiteSpace($DisplayName)) { $DisplayName = $PolicyFile.displayName ?? $PolicyFile.name }
+                if ([string]::IsNullOrWhiteSpace($DisplayName)) {
+                    throw "This device configuration template has no name - the template's Displayname column and the payload's displayName are both empty. Recreate the template."
+                }
+                $Null = $PolicyFile | Add-Member -MemberType NoteProperty -Name 'description' -Value "$Description" -Force
+                $null = $PolicyFile | Add-Member -MemberType NoteProperty -Name 'displayName' -Value $DisplayName -Force
+                $CheckExististing = New-GraphGETRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL" -tenantid $TenantFilter
+                $DeviceODataType = $PolicyFile.'@odata.type'
+                $FuzzyResult = Find-CIPPFuzzyPolicyMatch -DisplayName $DisplayName -ExistingPolicies $CheckExististing -MaxDistance $LevenshteinDistance -ODataType $DeviceODataType
                 $PolicyFile = $policyFile | Select-Object * -ExcludeProperty 'featureUpdatesWillBeRolledBack', 'qualityUpdatesWillBeRolledBack', 'qualityUpdatesPauseStartDate', 'featureUpdatesPauseStartDate'
                 $RawJSON = ConvertTo-Json -InputObject $PolicyFile -Depth 100 -Compress
-                if ($ExistingID) {
+                if ($FuzzyResult) {
                     $PostType = 'edited'
+                    $ExistingID = $FuzzyResult.Policy
+                    if ($FuzzyResult.MatchType -eq 'fuzzy') {
+                        Write-LogMessage -headers $Headers -API $APIName -tenant $tenantFilter -message "Fuzzy matched policy '$($FuzzyResult.OriginalName)' for template '$DisplayName' (distance=$($FuzzyResult.Distance))" -Sev Info
+                    }
                     Write-Host "Raw JSON is $RawJSON"
-                    $CreateRequest = New-GraphPOSTRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL/$($ExistingID.Id)" -tenantid $tenantFilter -type PATCH -body $RawJSON
-                    $CreateRequest = $CheckExististing | Where-Object -Property displayName -EQ $DisplayName
-                    Write-LogMessage -headers $Headers -API $APINAME -tenant $($tenantFilter) -message "Updated policy $($DisplayName) to template defaults" -Sev 'info'
+                    $CreateRequest = New-GraphPOSTRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL/$($ExistingID.Id)" -tenantid $tenantFilter -type PATCH -body $RawJSON -AddedHeaders $ApprovalHeaders
+                    $CreateRequest = $FuzzyResult.Policy
+                    Write-LogMessage -headers $Headers -API $APIName -tenant $($tenantFilter) -message "Updated policy $($DisplayName) to template defaults" -Sev Info
                 } else {
                     $PostType = 'added'
-                    $CreateRequest = New-GraphPOSTRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL" -tenantid $tenantFilter -type POST -body $RawJSON
-                    Write-LogMessage -headers $Headers -API $APINAME -tenant $($tenantFilter) -message "Added policy $($DisplayName) via template" -Sev 'info'
+                    $CreateRequest = New-GraphPOSTRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL" -tenantid $tenantFilter -type POST -body $RawJSON -AddedHeaders $ApprovalHeaders
+                    Write-LogMessage -headers $Headers -API $APIName -tenant $($tenantFilter) -message "Added policy $($DisplayName) via template" -Sev Info
 
                 }
             }
             'Catalog' {
                 $PlatformType = 'deviceManagement'
                 $TemplateTypeURL = 'configurationPolicies'
-                $DisplayName = ($RawJSON | ConvertFrom-Json).Name
-                $CheckExististing = New-GraphGETRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL" -tenantid $tenantFilter
-                if ($DisplayName -in $CheckExististing.name) {
+                $DisplayName = Get-CIPPIntunePolicyName -TemplateType 'Catalog' -RawJSON $RawJSON -DisplayName $DisplayName
+                if ([string]::IsNullOrWhiteSpace($DisplayName)) {
+                    throw "This Settings Catalog template has no name - the payload's 'name' and the template's Displayname column are both empty. The stored template row is corrupt (often a duplicate created by a re-import); delete and recreate it."
+                }
+                if ($ReusableSettings) {
+                    Write-Verbose "Catalog: ReusableSettings count $($ReusableSettings.Count)"
+                    Write-Verbose ('Catalog: ReusableSettings detail ' + ($ReusableSettings | ConvertTo-Json -Depth 5 -Compress))
+                    $syncResult = Sync-CIPPReusablePolicySettings -TemplateInfo ([pscustomobject]@{ RawJSON = $RawJSON; ReusableSettings = $ReusableSettings }) -Tenant $TenantFilter
+                    if ($syncResult.RawJSON) { $RawJSON = $syncResult.RawJSON }
+                } else {
+                    Write-Verbose 'Catalog: No ReusableSettings provided'
+                }
+
+                $Template = $RawJSON | ConvertFrom-Json
+                if ($Template.templateReference.templateId) {
+                    # Remove settings this tenant does not offer. The comparison paths run the
+                    # baseline through the same helper so they diff against what actually lands.
+                    $Template = Select-CIPPIntuneAvailableSetting -Policy $Template -TenantFilter $TenantFilter
+                    $RawJSON = ConvertTo-Json -InputObject $Template -Depth 100 -Compress
+                }
+
+                $CheckExististing = New-GraphGETRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL" -tenantid $TenantFilter
+                $CatalogTemplateId = $Template.templateReference.templateId
+                $FuzzyResult = Find-CIPPFuzzyPolicyMatch -DisplayName $DisplayName -ExistingPolicies $CheckExististing -MaxDistance $LevenshteinDistance -NameProperty 'name' -TemplateId $CatalogTemplateId
+                if ($FuzzyResult) {
                     $PolicyFile = $RawJSON | ConvertFrom-Json | Select-Object * -ExcludeProperty Platform, PolicyType, CreationSource
                     $RawJSON = ConvertTo-Json -InputObject $PolicyFile -Depth 100 -Compress
-                    $ExistingID = $CheckExististing | Where-Object -Property Name -EQ $DisplayName
-                    $CreateRequest = New-GraphPOSTRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL/$($ExistingID.Id)" -tenantid $tenantFilter -type PUT -body $RawJSON
-                    $CreateRequest = $CheckExististing | Where-Object -Property Name -EQ $DisplayName
+                    $ExistingID = $FuzzyResult.Policy
+                    if ($FuzzyResult.MatchType -eq 'fuzzy') {
+                        Write-LogMessage -headers $Headers -API $APIName -tenant $TenantFilter -message "Fuzzy matched policy '$($FuzzyResult.OriginalName)' for template '$DisplayName' (distance=$($FuzzyResult.Distance))" -Sev Info
+                    }
+                    $CreateRequest = New-GraphPOSTRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL/$($ExistingID.Id)" -tenantid $TenantFilter -type PUT -body $RawJSON -AddedHeaders $ApprovalHeaders
+                    $CreateRequest = $FuzzyResult.Policy
                     $PostType = 'edited'
                 } else {
                     $PostType = 'added'
-                    $CreateRequest = New-GraphPOSTRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL" -tenantid $tenantFilter -type POST -body $RawJSON
-                    Write-LogMessage -headers $Headers -API $APINAME -tenant $($tenantFilter) -message "Added policy $($DisplayName) via template" -Sev 'info'
+                    $CreateRequest = New-GraphPOSTRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL" -tenantid $TenantFilter -type POST -body $RawJSON -AddedHeaders $ApprovalHeaders
+                    Write-LogMessage -headers $Headers -API $APIName -tenant $($TenantFilter) -message "Added policy $($DisplayName) via template" -Sev Info
                 }
             }
             'windowsDriverUpdateProfiles' {
                 $PlatformType = 'deviceManagement'
                 $TemplateTypeURL = 'windowsDriverUpdateProfiles'
-                $File = ($RawJSON | ConvertFrom-Json)
-                $DisplayName = $File.displayName ?? $File.Name
-                $CheckExististing = New-GraphGETRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL" -tenantid $tenantFilter
-                if ($DisplayName -in $CheckExististing.displayName) {
+                $DisplayName = Get-CIPPIntunePolicyName -TemplateType $TemplateType -RawJSON $RawJSON -DisplayName $DisplayName
+                $CheckExististing = New-GraphGETRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL" -tenantid $TenantFilter
+                $FuzzyResult = Find-CIPPFuzzyPolicyMatch -DisplayName $DisplayName -ExistingPolicies $CheckExististing -MaxDistance $LevenshteinDistance
+                if ($FuzzyResult) {
                     $PostType = 'edited'
                     $PolicyFile = $RawJSON | ConvertFrom-Json | Select-Object * -ExcludeProperty inventorySyncStatus, newUpdates, deviceReporting, approvalType
                     $RawJSON = ConvertTo-Json -InputObject $PolicyFile -Depth 100 -Compress
-                    $ExistingID = $CheckExististing | Where-Object -Property displayName -EQ $displayname
+                    $ExistingID = $FuzzyResult.Policy
+                    if ($FuzzyResult.MatchType -eq 'fuzzy') {
+                        Write-LogMessage -headers $Headers -API $APIName -tenant $TenantFilter -message "Fuzzy matched policy '$($FuzzyResult.OriginalName)' for template '$DisplayName' (distance=$($FuzzyResult.Distance))" -Sev Info
+                    }
                     Write-Host 'We are editing'
-                    $CreateRequest = New-GraphPOSTRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL/$($ExistingID.Id)" -tenantid $tenantFilter -type PATCH -body $RawJSON
-                    $CreateRequest = $CheckExististing | Where-Object -Property displayName -EQ $DisplayName
+                    $CreateRequest = New-GraphPOSTRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL/$($ExistingID.Id)" -tenantid $TenantFilter -type PATCH -body $RawJSON -AddedHeaders $ApprovalHeaders
+                    $CreateRequest = $FuzzyResult.Policy
                 } else {
                     $PostType = 'added'
-                    $CreateRequest = New-GraphPOSTRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL" -tenantid $tenantFilter -type POST -body $RawJSON
-                    Write-LogMessage -headers $Headers -API $APINAME -tenant $($tenantFilter) -message "Added policy $($DisplayName) via template" -Sev 'info'
+                    $CreateRequest = New-GraphPOSTRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL" -tenantid $TenantFilter -type POST -body $RawJSON -AddedHeaders $ApprovalHeaders
+                    Write-LogMessage -headers $Headers -API $APIName -tenant $($TenantFilter) -message "Added policy $($DisplayName) via template" -Sev Info
                 }
             }
             'windowsFeatureUpdateProfiles' {
                 $PlatformType = 'deviceManagement'
                 $TemplateTypeURL = 'windowsFeatureUpdateProfiles'
-                $File = ($RawJSON | ConvertFrom-Json)
-                $DisplayName = $File.displayName ?? $File.Name
+                $DisplayName = Get-CIPPIntunePolicyName -TemplateType $TemplateType -RawJSON $RawJSON -DisplayName $DisplayName
                 $CheckExististing = New-GraphGETRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL" -tenantid $tenantFilter
-                if ($DisplayName -in $CheckExististing.displayName) {
+                $FuzzyResult = Find-CIPPFuzzyPolicyMatch -DisplayName $DisplayName -ExistingPolicies $CheckExististing -MaxDistance $LevenshteinDistance
+                if ($FuzzyResult) {
                     $PostType = 'edited'
                     $PolicyFile = $RawJSON | ConvertFrom-Json | Select-Object * -ExcludeProperty deployableContentDisplayName, endOfSupportDate, installLatestWindows10OnWindows11IneligibleDevice
                     $RawJSON = ConvertTo-Json -InputObject $PolicyFile -Depth 100 -Compress
-                    $ExistingID = $CheckExististing | Where-Object -Property displayName -EQ $displayname
+                    $ExistingID = $FuzzyResult.Policy
+                    if ($FuzzyResult.MatchType -eq 'fuzzy') {
+                        Write-LogMessage -headers $Headers -API $APIName -tenant $TenantFilter -message "Fuzzy matched policy '$($FuzzyResult.OriginalName)' for template '$DisplayName' (distance=$($FuzzyResult.Distance))" -Sev Info
+                    }
                     Write-Host 'We are editing'
-                    $CreateRequest = New-GraphPOSTRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL/$($ExistingID.Id)" -tenantid $tenantFilter -type PATCH -body $RawJSON
-                    $CreateRequest = $CheckExististing | Where-Object -Property displayName -EQ $DisplayName
+                    $CreateRequest = New-GraphPOSTRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL/$($ExistingID.Id)" -tenantid $TenantFilter -type PATCH -body $RawJSON -AddedHeaders $ApprovalHeaders
+                    $CreateRequest = $FuzzyResult.Policy
 
                 } else {
                     $PostType = 'added'
-                    $CreateRequest = New-GraphPOSTRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL" -tenantid $tenantFilter -type POST -body $RawJSON
-                    Write-LogMessage -headers $Headers -API $APINAME -tenant $($tenantFilter) -message "Added policy $($DisplayName) via template" -Sev 'info'
+                    $CreateRequest = New-GraphPOSTRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL" -tenantid $TenantFilter -type POST -body $RawJSON -AddedHeaders $ApprovalHeaders
+                    Write-LogMessage -headers $Headers -API $APIName -tenant $($TenantFilter) -message "Added policy $($DisplayName) via template" -Sev Info
                 }
             }
             'windowsQualityUpdatePolicies' {
                 $PlatformType = 'deviceManagement'
                 $TemplateTypeURL = 'windowsQualityUpdatePolicies'
-                $File = ($RawJSON | ConvertFrom-Json)
-                $DisplayName = $File.displayName ?? $File.Name
-                $CheckExististing = New-GraphGETRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL" -tenantid $tenantFilter
-                if ($DisplayName -in $CheckExististing.displayName) {
+                $DisplayName = Get-CIPPIntunePolicyName -TemplateType $TemplateType -RawJSON $RawJSON -DisplayName $DisplayName
+                $CheckExististing = New-GraphGETRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL" -tenantid $TenantFilter
+                $FuzzyResult = Find-CIPPFuzzyPolicyMatch -DisplayName $DisplayName -ExistingPolicies $CheckExististing -MaxDistance $LevenshteinDistance
+                if ($FuzzyResult) {
                     $PostType = 'edited'
                     $PolicyFile = $RawJSON | ConvertFrom-Json | Select-Object *
                     $RawJSON = ConvertTo-Json -InputObject $PolicyFile -Depth 100 -Compress
-                    $ExistingID = $CheckExististing | Where-Object -Property displayName -EQ $displayname
+                    $ExistingID = $FuzzyResult.Policy
+                    if ($FuzzyResult.MatchType -eq 'fuzzy') {
+                        Write-LogMessage -headers $Headers -API $APIName -tenant $TenantFilter -message "Fuzzy matched policy '$($FuzzyResult.OriginalName)' for template '$DisplayName' (distance=$($FuzzyResult.Distance))" -Sev Info
+                    }
                     Write-Host 'We are editing'
-                    $CreateRequest = New-GraphPOSTRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL/$($ExistingID.Id)" -tenantid $tenantFilter -type PATCH -body $RawJSON
-                    $CreateRequest = $CheckExististing | Where-Object -Property displayName -EQ $DisplayName
+                    $CreateRequest = New-GraphPOSTRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL/$($ExistingID.Id)" -tenantid $TenantFilter -type PATCH -body $RawJSON -AddedHeaders $ApprovalHeaders
+                    $CreateRequest = $FuzzyResult.Policy
                 } else {
                     $PostType = 'added'
-                    $CreateRequest = New-GraphPOSTRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL" -tenantid $tenantFilter -type POST -body $RawJSON
-                    Write-LogMessage -headers $Headers -API $APINAME -tenant $($tenantFilter) -message "Added policy $($DisplayName) via template" -Sev 'info'
+                    $CreateRequest = New-GraphPOSTRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL" -tenantid $TenantFilter -type POST -body $RawJSON -AddedHeaders $ApprovalHeaders
+                    Write-LogMessage -headers $Headers -API $APIName -tenant $($TenantFilter) -message "Added policy $($DisplayName) via template" -Sev Info
+                }
+            }
+            'hardwareConfigurations' {
+                $PlatformType = 'deviceManagement'
+                $TemplateTypeURL = 'hardwareConfigurations'
+                $PolicyFile = $RawJSON | ConvertFrom-Json
+                if ([string]::IsNullOrWhiteSpace($DisplayName)) { $DisplayName = $PolicyFile.displayName }
+                if ([string]::IsNullOrWhiteSpace($DisplayName)) {
+                    throw "This BIOS configuration template has no name - the template's Displayname column and the payload's displayName are both empty. Recreate the template."
+                }
+                $Null = $PolicyFile | Add-Member -MemberType NoteProperty -Name 'description' -Value "$Description" -Force
+                $null = $PolicyFile | Add-Member -MemberType NoteProperty -Name 'displayName' -Value $DisplayName -Force
+                # version is incremented by Intune on every edit and rejected on the way in.
+                $PolicyFile = $PolicyFile | Select-Object * -ExcludeProperty id, version, createdDateTime, lastModifiedDateTime, '@odata.context'
+                $RawJSON = ConvertTo-Json -InputObject $PolicyFile -Depth 100 -Compress
+                $CheckExististing = New-GraphGETRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL" -tenantid $TenantFilter
+                $FuzzyResult = Find-CIPPFuzzyPolicyMatch -DisplayName $DisplayName -ExistingPolicies $CheckExististing -MaxDistance $LevenshteinDistance
+                if ($FuzzyResult) {
+                    $PostType = 'edited'
+                    $ExistingID = $FuzzyResult.Policy
+                    if ($FuzzyResult.MatchType -eq 'fuzzy') {
+                        Write-LogMessage -headers $Headers -API $APIName -tenant $TenantFilter -message "Fuzzy matched policy '$($FuzzyResult.OriginalName)' for template '$DisplayName' (distance=$($FuzzyResult.Distance))" -Sev Info
+                    }
+                    $CreateRequest = New-GraphPOSTRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL/$($ExistingID.Id)" -tenantid $TenantFilter -type PATCH -body $RawJSON -AddedHeaders $ApprovalHeaders
+                    $CreateRequest = $FuzzyResult.Policy
+                    Write-LogMessage -headers $Headers -API $APIName -tenant $($TenantFilter) -message "Updated policy $($DisplayName) to template defaults" -Sev Info
+                } else {
+                    $PostType = 'added'
+                    $CreateRequest = New-GraphPOSTRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL" -tenantid $TenantFilter -type POST -body $RawJSON -AddedHeaders $ApprovalHeaders
+                    Write-LogMessage -headers $Headers -API $APIName -tenant $($TenantFilter) -message "Added policy $($DisplayName) via template" -Sev Info
                 }
             }
             'windowsQualityUpdateProfiles' {
                 $PlatformType = 'deviceManagement'
                 $TemplateTypeURL = 'windowsQualityUpdateProfiles'
-                $File = ($RawJSON | ConvertFrom-Json)
-                $DisplayName = $File.displayName ?? $File.Name
-                $CheckExististing = New-GraphGETRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL" -tenantid $tenantFilter
-                if ($DisplayName -in $CheckExististing.displayName) {
+                $DisplayName = Get-CIPPIntunePolicyName -TemplateType $TemplateType -RawJSON $RawJSON -DisplayName $DisplayName
+                $CheckExististing = New-GraphGETRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL" -tenantid $TenantFilter
+                $FuzzyResult = Find-CIPPFuzzyPolicyMatch -DisplayName $DisplayName -ExistingPolicies $CheckExististing -MaxDistance $LevenshteinDistance
+                if ($FuzzyResult) {
                     $PostType = 'edited'
                     $PolicyFile = $RawJSON | ConvertFrom-Json | Select-Object * -ExcludeProperty releaseDateDisplayName, deployableContentDisplayName
                     $RawJSON = ConvertTo-Json -InputObject $PolicyFile -Depth 100 -Compress
-                    $ExistingID = $CheckExististing | Where-Object -Property displayName -EQ $displayname
+                    $ExistingID = $FuzzyResult.Policy
+                    if ($FuzzyResult.MatchType -eq 'fuzzy') {
+                        Write-LogMessage -headers $Headers -API $APIName -tenant $TenantFilter -message "Fuzzy matched policy '$($FuzzyResult.OriginalName)' for template '$DisplayName' (distance=$($FuzzyResult.Distance))" -Sev Info
+                    }
                     Write-Host 'We are editing'
-                    $CreateRequest = New-GraphPOSTRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL/$($ExistingID.Id)" -tenantid $tenantFilter -type PATCH -body $RawJSON
-                    $CreateRequest = $CheckExististing | Where-Object -Property displayName -EQ $DisplayName
+                    $CreateRequest = New-GraphPOSTRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL/$($ExistingID.Id)" -tenantid $TenantFilter -type PATCH -body $RawJSON -AddedHeaders $ApprovalHeaders
+                    $CreateRequest = $FuzzyResult.Policy
                 } else {
                     $PostType = 'added'
-                    $CreateRequest = New-GraphPOSTRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL" -tenantid $tenantFilter -type POST -body $RawJSON
-                    Write-LogMessage -headers $Headers -API $APINAME -tenant $($tenantFilter) -message "Added policy $($DisplayName) via template" -Sev 'info'
+                    $CreateRequest = New-GraphPOSTRequest -uri "https://graph.microsoft.com/beta/$PlatformType/$TemplateTypeURL" -tenantid $TenantFilter -type POST -body $RawJSON -AddedHeaders $ApprovalHeaders
+                    Write-LogMessage -headers $Headers -API $APIName -tenant $($TenantFilter) -message "Added policy $($DisplayName) via template" -Sev Info
                 }
             }
         }
-        Write-LogMessage -headers $Headers -API $APINAME -tenant $($tenantFilter) -message "$($PostType) policy $($Displayname)" -Sev 'Info'
+        Write-LogMessage -headers $Headers -API $APIName -tenant $($TenantFilter) -message "$($PostType) policy $($DisplayName)" -Sev Info
         if ($AssignTo) {
-            Write-Host "Assigning policy to $($AssignTo) with ID $($CreateRequest.id) and type $TemplateTypeURL for tenant $tenantFilter"
+            Write-Host "Assigning policy to $($AssignTo) with ID $($CreateRequest.id) and type $TemplateTypeURL for tenant $TenantFilter"
             Write-Host "ID is $($CreateRequest.id)"
 
-            Set-CIPPAssignedPolicy -GroupName $AssignTo -PolicyId $CreateRequest.id -PlatformType $PlatformType -Type $TemplateTypeURL -TenantFilter $tenantFilter -ExcludeGroup $ExcludeGroup
+            $AssignParams = @{
+                GroupName      = $AssignTo
+                PolicyId       = $CreateRequest.id
+                PlatformType   = $PlatformType
+                Type           = $TemplateTypeURL
+                TenantFilter   = $tenantFilter
+                ExcludeGroup   = $ExcludeGroup
+                AssignmentMode = $AssignmentMode
+            }
+
+            if ($AssignmentFilterName) {
+                $AssignParams.AssignmentFilterName = $AssignmentFilterName
+                $AssignParams.AssignmentFilterType = $AssignmentFilterType
+            }
+
+            Set-CIPPAssignedPolicy @AssignParams
         }
-        return "Successfully $($PostType) policy for $($tenantFilter) with display name $($Displayname)"
+        return "Successfully $($PostType) policy for $($TenantFilter) with display name $($DisplayName)"
     } catch {
         $ErrorMessage = Get-CippException -Exception $_
-        Write-LogMessage -headers $Headers -API $APINAME -tenant $($tenantFilter) -message "Failed $($PostType) policy $($Displayname). Error: $($ErrorMessage.NormalizedError)" -Sev 'Error' -LogData $ErrorMessage
-        throw "Failed to add or set policy for $($tenantFilter) with display name $($Displayname): $($ErrorMessage.NormalizedError)"
+        Write-LogMessage -headers $Headers -API $APIName -tenant $($TenantFilter) -message "Failed $($PostType) policy $($DisplayName). Error: $($ErrorMessage.NormalizedError)" -Sev 'Error' -LogData $ErrorMessage
+        throw "Failed to add or set policy for $($TenantFilter) with display name $($DisplayName): $($ErrorMessage.NormalizedError)"
     }
 }

@@ -1,28 +1,70 @@
 function Test-CIPPAccess {
     param(
         $Request,
-        [switch]$TenantList
+        [switch]$TenantList,
+        [switch]$GroupList
     )
-    if ($Request.Params.CIPPEndpoint -eq 'ExecSAMSetup') { return $true }
+    # Initialize per-call profiling
+    $AccessTimings = @{}
+    $AccessTotalSw = [System.Diagnostics.Stopwatch]::StartNew()
+
+    # Request-local identity context, read by New-CippCoreRequest for its per-request
+    # access log line. Reset here so a denied call never reports the previous caller.
+    $script:CippAccessUserContext = $null
+    # Request-local impersonation marker; reset so it never leaks between requests.
+    $script:CippImpersonation = $null
 
     # Get function help
     $FunctionName = 'Invoke-{0}' -f $Request.Params.CIPPEndpoint
 
-    if ($FunctionName -ne 'Invoke-me') {
-        try {
-            $Help = Get-Help $FunctionName -ErrorAction Stop
-        } catch {
-            Write-Warning "Function '$FunctionName' not found"
+    $SwPermissions = [System.Diagnostics.Stopwatch]::StartNew()
+    if (-not $script:CIPPFunctionPermissions) {
+        if ($global:CIPPFunctionPermissions) {
+            $script:CIPPFunctionPermissions = $global:CIPPFunctionPermissions
+        } else {
+            $PermissionsFileJson = Join-Path $env:CIPPRootPath 'Config\function-permissions.json'
+
+            if (Test-Path $PermissionsFileJson) {
+                try {
+                    $script:CIPPFunctionPermissions = [System.IO.File]::ReadAllText($PermissionsFileJson) | ConvertFrom-Json -AsHashtable
+                    Write-Debug "Loaded $($script:CIPPFunctionPermissions.Count) function permissions from JSON cache"
+                } catch {
+                    Write-Warning "Failed to load function permissions from JSON: $($_.Exception.Message)"
+                }
+            }
         }
     }
+    $SwPermissions.Stop()
+    $AccessTimings['FunctionPermissions'] = $SwPermissions.Elapsed.TotalMilliseconds
 
-    # Check help for role
-    $APIRole = $Help.Role
+    if ($FunctionName -ne 'Invoke-me') {
+        $swHelp = [System.Diagnostics.Stopwatch]::StartNew()
+        if ($script:CIPPFunctionPermissions -and $script:CIPPFunctionPermissions.ContainsKey($FunctionName)) {
+            $PermissionData = $script:CIPPFunctionPermissions[$FunctionName]
+            $APIRole = $PermissionData['Role']
+            $Functionality = $PermissionData['Functionality']
+            Write-Debug "Loaded function permission data from cache for '$FunctionName': Role='$APIRole', Functionality='$Functionality'"
+        } else {
+            try {
+                $Help = Get-Help $FunctionName -ErrorAction Stop
+                $APIRole = $Help.Role
+                $Functionality = $Help.Functionality
+                Write-Debug "Loaded function permission data via Get-Help for '$FunctionName': Role='$APIRole', Functionality='$Functionality'"
+            } catch {
+                Write-Warning "Function '$FunctionName' not found"
+            }
+        }
+        $swHelp.Stop()
+        $AccessTimings['GetHelp'] = $swHelp.Elapsed.TotalMilliseconds
+    }
 
-    # Get default roles from config
-    $CIPPCoreModuleRoot = Get-Module -Name CIPPCore | Select-Object -ExpandProperty ModuleBase
-    $CIPPRoot = (Get-Item $CIPPCoreModuleRoot).Parent.Parent
-    $BaseRoles = Get-Content -Path $CIPPRoot\Config\cipp-roles.json | ConvertFrom-Json
+    # Get default roles from config (cache per runspace for performance)
+    $swRolesLoad = [System.Diagnostics.Stopwatch]::StartNew()
+    if (-not $script:CIPPBaseRoles) {
+        $script:CIPPBaseRoles = [System.IO.File]::ReadAllText((Join-Path $env:CIPPRootPath 'Config\cipp-roles.json')) | ConvertFrom-Json
+    }
+    $swRolesLoad.Stop()
+    $AccessTimings['LoadBaseRoles'] = $swRolesLoad.Elapsed.TotalMilliseconds
     $DefaultRoles = @('superadmin', 'admin', 'editor', 'readonly', 'anonymous', 'authenticated')
 
     if ($APIRole -eq 'Public') {
@@ -31,6 +73,7 @@ function Test-CIPPAccess {
 
     if ($Request.Headers.'x-ms-client-principal-idp' -eq 'aad' -and $Request.Headers.'x-ms-client-principal-name' -match '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') {
         $Type = 'APIClient'
+        $swApiClient = [System.Diagnostics.Stopwatch]::StartNew()
         # Direct API Access
         $ForwardedFor = $Request.Headers.'x-forwarded-for' -split ',' | Select-Object -First 1
         $IPRegex = '^(?<IP>(?:\d{1,3}(?:\.\d{1,3}){3}|\[[0-9a-fA-F:]+\]|[0-9a-fA-F:]+))(?::\d+)?$'
@@ -39,6 +82,11 @@ function Test-CIPPAccess {
         $Client = Get-CippApiClient -AppId $Request.Headers.'x-ms-client-principal-name'
         if ($Client) {
             Write-Information "API Access: AppName=$($Client.AppName), AppId=$($Request.Headers.'x-ms-client-principal-name'), IP=$IPAddress"
+            # Set before the IP check so an IP-range denial is still attributed to the client
+            $script:CippAccessUserContext = [PSCustomObject]@{
+                User  = "$($Client.AppName) ($IPAddress)"
+                Roles = @($Client.Role ?? 'cipp-api')
+            }
             $IPMatched = $false
             if ($Client.IPRange -notcontains 'Any') {
                 foreach ($Range in $Client.IPRange) {
@@ -59,7 +107,7 @@ function Test-CIPPAccess {
                         }
                     }
                     $BaseRole = $null
-                    foreach ($Role in $BaseRoles.PSObject.Properties) {
+                    foreach ($Role in $script:CIPPBaseRoles.PSObject.Properties) {
                         foreach ($ClientRole in $Client.Role) {
                             if ($Role.Name -eq $ClientRole) {
                                 $BaseRole = $Role
@@ -76,10 +124,14 @@ function Test-CIPPAccess {
         } else {
             $CustomRoles = @('cipp-api')
             Write-Information "API Access: AppId=$($Request.Headers.'x-ms-client-principal-name'), IP=$IPAddress"
+            $script:CippAccessUserContext = [PSCustomObject]@{
+                User  = "AppId $($Request.Headers.'x-ms-client-principal-name') ($IPAddress)"
+                Roles = @('cipp-api')
+            }
         }
         if ($Request.Params.CIPPEndpoint -eq 'me') {
             $Permissions = Get-CippAllowedPermissions -UserRoles $CustomRoles
-            Push-OutputBinding -Name Response -Value ([HttpResponseContext]@{
+            return ([HttpResponseContext]@{
                     StatusCode = [HttpStatusCode]::OK
                     Body       = (
                         @{
@@ -87,27 +139,94 @@ function Test-CIPPAccess {
                                 appId   = $Request.Headers.'x-ms-client-principal-name'
                                 appRole = $CustomRoles
                             }
-                            'permissions'     = $Permissions
+                            'permissions'     = @($Permissions)
                         } | ConvertTo-Json -Depth 5)
                 })
-            return
         }
+        $swApiClient.Stop()
+        $AccessTimings['ApiClientBranch'] = $swApiClient.Elapsed.TotalMilliseconds
 
     } else {
         $Type = 'User'
+        $swUserBranch = [System.Diagnostics.Stopwatch]::StartNew()
         $User = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($Request.Headers.'x-ms-client-principal')) | ConvertFrom-Json
+
+        if ($User.claims -and [string]::IsNullOrWhiteSpace($User.userDetails)) {
+            $Claims = @($User.claims)
+            $Upn = ($Claims | Where-Object { $_.typ -in @('preferred_username', 'upn', 'http://schemas.xmlsoap.org/ws/2005/05/identity/claims/upn', 'email', 'http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress') } | Select-Object -First 1).val
+            if ([string]::IsNullOrWhiteSpace($Upn)) { $Upn = $Request.Headers.'x-ms-client-principal-name' }
+            $Oid = ($Claims | Where-Object { $_.typ -in @('http://schemas.microsoft.com/identity/claims/objectidentifier', 'oid') } | Select-Object -First 1).val
+            $User = [pscustomobject]@{
+                identityProvider = 'aad'
+                userId           = $Oid
+                userDetails      = $Upn
+                userRoles        = @('authenticated', 'anonymous')
+            }
+        }
 
         # Check for roles granted via group membership
         if (($User.userRoles | Measure-Object).Count -eq 2 -and $User.userRoles -contains 'authenticated' -and $User.userRoles -contains 'anonymous') {
+            $swResolveUserRoles = [System.Diagnostics.Stopwatch]::StartNew()
             $User = Test-CIPPAccessUserRole -User $User
+            $swResolveUserRoles.Stop()
+            $AccessTimings['ResolveUserRoles'] = $swResolveUserRoles.Elapsed.TotalMilliseconds
         }
 
-        #Write-Information ($User | ConvertTo-Json -Depth 5)
-        # Return user permissions
+        $swIPCheck = [System.Diagnostics.Stopwatch]::StartNew()
+        if (-not $User.userRoles) {
+            throw 'Access denied: unable to resolve roles for the authenticated principal'
+        }
+
+        # IP enforcement deliberately uses the REAL roles, never the impersonated one: a
+        # role's IP allowlist describes where its actual members sign in from, and
+        # simulating it locks the impersonating superadmin out of the entire UI, /me and
+        # the exit banner included.
+        $AllowedIPRanges = Get-CIPPRoleIPRanges -Roles $User.userRoles
+
+        if ($AllowedIPRanges -notcontains 'Any') {
+            $ForwardedFor = $Request.Headers.'x-forwarded-for' -split ',' | Select-Object -First 1
+            $IPRegex = '^(?<IP>(?:\d{1,3}(?:\.\d{1,3}){3}|\[[0-9a-fA-F:]+\]|[0-9a-fA-F:]+))(?::\d+)?$'
+            $IPAddress = $ForwardedFor -replace $IPRegex, '$1' -replace '[\[\]]', ''
+            if ($IPAddress) {
+                $IPAllowed = $false
+                foreach ($Range in $AllowedIPRanges) {
+                    if ($IPAddress -eq $Range -or (Test-IpInRange -IPAddress $IPAddress -Range $Range)) {
+                        $IPAllowed = $true
+                        break
+                    }
+                }
+
+                if ((-not $IPAllowed) -and ($Request.Params.CIPPEndpoint -ne 'me')) {
+                    throw "Access to this CIPP API endpoint is not allowed, your IP address ($IPAddress) is not in the allowed range for your role(s)"
+                }
+            } else {
+                $IPAllowed = $true
+            }
+        } else {
+            $IPAllowed = $true
+        }
+
+        $swIPCheck.Stop()
+        $AccessTimings['IPRangeCheck'] = $swIPCheck.Elapsed.TotalMilliseconds
+
+        # Superadmin-only role impersonation: everything downstream (/me permissions,
+        # base/custom role checks, tenant scoping) evaluates under the impersonated role.
+        # Only the IP check above is exempt, so impersonation can never lock the UI.
+        $Impersonation = Resolve-CippImpersonation -User $User -Request $Request
+        $User = $Impersonation.User
+        if ($Impersonation.Impersonating) {
+            $script:CippImpersonation = $Impersonation
+        }
+
+        $script:CippAccessUserContext = [PSCustomObject]@{
+            User  = if ($Impersonation.Impersonating) { "$($User.userDetails) (impersonating $($Impersonation.Impersonating))" } else { $User.userDetails }
+            Roles = @($User.userRoles | Where-Object { $_ -notin @('anonymous', 'authenticated') })
+        }
+
         if ($Request.Params.CIPPEndpoint -eq 'me') {
 
             if (!$User.userRoles) {
-                Push-OutputBinding -Name Response -Value ([HttpResponseContext]@{
+                return ([HttpResponseContext]@{
                         StatusCode = [HttpStatusCode]::OK
                         Body       = (
                             @{
@@ -117,16 +236,117 @@ function Test-CIPPAccess {
                     })
             }
 
+            if (!$IPAllowed) {
+                return ([HttpResponseContext]@{
+                        StatusCode = [HttpStatusCode]::OK
+                        Body       = (
+                            @{
+                                'clientPrincipal' = $null
+                                'permissions'     = @()
+                                'message'         = "Your IP address ($IPAddress) is not in the allowed range for your role(s)"
+                            } | ConvertTo-Json -Depth 5)
+                    })
+            }
+
+            $swPermsMe = [System.Diagnostics.Stopwatch]::StartNew()
             $Permissions = Get-CippAllowedPermissions -UserRoles $User.userRoles
-            Push-OutputBinding -Name Response -Value ([HttpResponseContext]@{
+            $swPermsMe.Stop()
+            $AccessTimings['GetPermissions(me)'] = $swPermsMe.Elapsed.TotalMilliseconds
+
+            # Include SSO migration status for admins with AppSettings permissions
+            $MeResponse = @{
+                'clientPrincipal' = $User
+                'permissions'     = @($Permissions)
+            }
+            if ($script:CippImpersonation) {
+                # The frontend banner needs these to render the exit affordance even when
+                # the impersonated role has almost no permissions.
+                $MeResponse['impersonating'] = $script:CippImpersonation.Impersonating
+                $MeResponse['realUserRoles'] = @($script:CippImpersonation.RealRoles)
+            }
+
+            # Hosted payment status checks — shown to all users (no permission gating)
+            if ($env:cipp_hosted_subscription_ended) {
+                $MeResponse['hostedSubscriptionEnded'] = $true
+            }
+            if ($env:cipp_hosted_failed_payments) {
+                $MeResponse['hostedFailedPayments'] = $true
+            }
+            # CyberDrain-hosted instance (CIPP_HOSTED is set by the hosted deployment templates).
+            # Lets the frontend point at the management portal for anything the instance's own
+            # identity cannot do, such as custom domains on the shared App Service plan.
+            $MeResponse['hosted'] = $env:CIPP_HOSTED -eq 'true'
+            # CIPP-NG (container web app on an App Service plan) versus a legacy function app plus
+            # static web app - the backend page shows different resources for each.
+            $MeResponse['ng'] = $env:CIPPNG -eq 'true'
+
+            $CanManageAppSettings = $Permissions -contains 'CIPP.AppSettings.ReadWrite'
+            $HasAnyPermission = ($Permissions | Measure-Object).Count -gt 0
+
+            # Initial setup state: real (non-placeholder) SAM credentials loaded in this
+            # worker. Placeholder set matches Get-CIPPAuthentication/Initialize-CIPPAuth.
+            # The frontend blocks the whole UI behind the setup wizard until complete;
+            # samAppPresent distinguishes "no app registration at all" from "app exists
+            # but the refresh token is missing" so the wizard can offer a token reset.
+            $PlaceholderPattern = '^(LongApplicationId|AppSecret|RefreshToken|tenantId)$'
+            $TestSamCredentials = {
+                $HasAppId = [bool]($env:ApplicationID -and $env:ApplicationID -notmatch $PlaceholderPattern -and
+                    $env:TenantID -and $env:TenantID -notmatch $PlaceholderPattern)
+                $HasRefreshToken = [bool]($env:RefreshToken -and $env:RefreshToken -notmatch $PlaceholderPattern)
+                @{ HasAppId = $HasAppId; Complete = ($HasAppId -and $HasRefreshToken) }
+            }
+            $SamState = & $TestSamCredentials
+            if (-not $SamState.Complete) {
+                # Env vars are per-worker and loaded at warmup, so setup completed on
+                # another worker leaves this one stale. Reload at most once per 30s per
+                # worker, tracked in an env var because runspaces don't share script
+                # scope, so an unconfigured instance doesn't hit storage on every poll.
+                $NowUnix = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+                $LastAttempt = [int64]0
+                $null = [int64]::TryParse($env:CippMeAuthReloadAt, [ref]$LastAttempt)
+                if (($NowUnix - $LastAttempt) -ge 30) {
+                    $env:CippMeAuthReloadAt = [string]$NowUnix
+                    $null = Get-CIPPAuthentication
+                    $SamState = & $TestSamCredentials
+                }
+            }
+            $MeResponse['initialSetupComplete'] = $SamState.Complete
+            $MeResponse['samAppPresent'] = $SamState.HasAppId
+
+            # Forced SSO migration: non-dismissible prompt when migration env var is set.
+            # Suppressed until initial setup (SAM app) is complete — the setup wizard has
+            # to run first, and ExecSSOSetup needs the SAM app to create the CIPP-SSO
+            # registration.
+            $InitialSetupComplete = $SamState.Complete
+            if ($env:CIPP_SSO_MIGRATION_APPID -and $CanManageAppSettings -and $InitialSetupComplete) {
+                $MeResponse['forceSsoMigration'] = @{
+                    appId  = $env:CIPP_SSO_MIGRATION_APPID
+                    status = 'pending'
+                }
+            }
+
+            if ($env:CIPPNG -ne 'true' -and $HasAnyPermission) {
+                try {
+                    $SSOTable = Get-CIPPTable -tablename 'SSOMigration'
+                    $SSOMigration = Get-CIPPAzDataTableEntity @SSOTable -Filter "PartitionKey eq 'SSO' and RowKey eq 'MigrationConfig'" -ErrorAction SilentlyContinue
+                    if ($SSOMigration) {
+                        $MeResponse['ssoMigration'] = @{
+                            status      = $SSOMigration.Status
+                            appId       = $SSOMigration.AppId
+                            multiTenant = [bool]($SSOMigration.MultiTenant -eq 'true' -or $SSOMigration.MultiTenant -eq 'True')
+                        }
+                    } else {
+                        $MeResponse['ssoMigration'] = @{ status = 'none' }
+                    }
+                } catch {
+                    $MeResponse['ssoMigration'] = @{ status = 'none' }
+                }
+            }
+
+            return ([HttpResponseContext]@{
                     StatusCode = [HttpStatusCode]::OK
-                    Body       = (
-                        @{
-                            'clientPrincipal' = $User
-                            'permissions'     = $Permissions
-                        } | ConvertTo-Json -Depth 5)
+                    Body       = ($MeResponse | ConvertTo-Json -Depth 5)
                 })
-            return
         }
 
         if ($User.userRoles -contains 'admin' -or $User.userRoles -contains 'superadmin') {
@@ -148,7 +368,7 @@ function Test-CIPPAccess {
         } elseif ($User.userRoles -contains 'admin') {
             $User.userRoles = @('admin')
         }
-        foreach ($Role in $BaseRoles.PSObject.Properties) {
+        foreach ($Role in $script:CIPPBaseRoles.PSObject.Properties) {
             foreach ($UserRole in $User.userRoles) {
                 if ($Role.Name -eq $UserRole) {
                     $BaseRole = $Role
@@ -161,7 +381,6 @@ function Test-CIPPAccess {
 
     # Check base role permissions before continuing to custom roles
     if ($null -ne $BaseRole) {
-        Write-Information "Base Role: $($BaseRole.Name)"
         $BaseRoleAllowed = $false
         foreach ($Include in $BaseRole.Value.include) {
             if ($APIRole -like $Include) {
@@ -188,63 +407,105 @@ function Test-CIPPAccess {
         if (@('admin', 'superadmin') -contains $BaseRole.Name) {
             return $true
         } else {
+            # Scope-only requests resolve from the cached rules. On a warm cache this needs no
+            # storage read at all, and it only needs the tenant table when a rule actually says
+            # 'all tenants except', because that is the one case where the answer depends on
+            # which tenants currently exist.
+            if ($TenantList.IsPresent -or $GroupList.IsPresent) {
+                $swScopeRules = [System.Diagnostics.Stopwatch]::StartNew()
+                $ScopeRules = foreach ($CustomRole in $CustomRoles) {
+                    try {
+                        Get-CippAccessScopeRule -Role $CustomRole
+                    } catch {
+                        Write-Information $_.Exception.Message
+                    }
+                }
+                $swScopeRules.Stop()
+                $AccessTimings['GetScopeRules'] = $swScopeRules.Elapsed.TotalMilliseconds
+
+                if (($ScopeRules | Measure-Object).Count -eq 0) {
+                    # No role produced a scope, so the caller is entitled to nothing
+                    return @()
+                }
+
+                if ($TenantList.IsPresent) {
+                    $swTenantList = [System.Diagnostics.Stopwatch]::StartNew()
+                    $NeedsTenantList = @($ScopeRules | Where-Object { -not $_.Unrestricted -and $_.AllowAllTenants }).Count -gt 0
+                    $Tenants = if ($NeedsTenantList) { Get-Tenants -IncludeErrors } else { @() }
+
+                    $LimitedTenantList = foreach ($Rule in $ScopeRules) {
+                        if ($Rule.Unrestricted) {
+                            @('AllTenants')
+                        } else {
+                            $AllowedForRule = if ($Rule.AllowAllTenants) { $Tenants.customerId } else { $Rule.AllowedTenants }
+                            $AllowedForRule | Where-Object { $Rule.BlockedTenants -notcontains $_ }
+                        }
+                    }
+                    $swTenantList.Stop()
+                    $AccessTimings['BuildTenantList'] = $swTenantList.Elapsed.TotalMilliseconds
+                    return @($LimitedTenantList | Sort-Object -Unique)
+                }
+
+                Write-Information "Getting allowed groups for roles: $($CustomRoles -join ', ')"
+                $swGroupList = [System.Diagnostics.Stopwatch]::StartNew()
+                $LimitedGroupList = foreach ($Rule in $ScopeRules) {
+                    if ($Rule.Unrestricted) { @('AllGroups') } else { $Rule.AllowedGroups }
+                }
+                $swGroupList.Stop()
+                $AccessTimings['BuildGroupList'] = $swGroupList.Elapsed.TotalMilliseconds
+                return @($LimitedGroupList | Sort-Object -Unique)
+            }
+
+            $swTenantsLoad = [System.Diagnostics.Stopwatch]::StartNew()
             $Tenants = Get-Tenants -IncludeErrors
+            $swTenantsLoad.Stop()
+            $AccessTimings['LoadTenants'] = $swTenantsLoad.Elapsed.TotalMilliseconds
             $PermissionsFound = $false
+            $swRolePerms = [System.Diagnostics.Stopwatch]::StartNew()
             $PermissionSet = foreach ($CustomRole in $CustomRoles) {
                 try {
                     Get-CIPPRolePermissions -Role $CustomRole
                     $PermissionsFound = $true
                 } catch {
                     Write-Information $_.Exception.Message
-                    continue
                 }
             }
+            $swRolePerms.Stop()
+            $AccessTimings['GetRolePermissions'] = $swRolePerms.Elapsed.TotalMilliseconds
+
             if ($PermissionsFound) {
-                if ($TenantList.IsPresent) {
-                    $LimitedTenantList = foreach ($Permission in $PermissionSet) {
-                        if ((($Permission.AllowedTenants | Measure-Object).Count -eq 0 -or $Permission.AllowedTenants -contains 'AllTenants') -and (($Permission.BlockedTenants | Measure-Object).Count -eq 0)) {
-                            @('AllTenants')
-                        } else {
-                            # Expand tenant groups to individual tenant IDs
-                            $ExpandedAllowedTenants = foreach ($AllowedItem in $Permission.AllowedTenants) {
-                                if ($AllowedItem -is [PSCustomObject] -and $AllowedItem.type -eq 'Group') {
-                                    try {
-                                        $GroupMembers = Expand-CIPPTenantGroups -TenantFilter @($AllowedItem)
-                                        $GroupMembers | ForEach-Object { $_.addedFields.customerId }
-                                    } catch {
-                                        Write-Warning "Failed to expand tenant group '$($AllowedItem.label)': $($_.Exception.Message)"
-                                        @()
-                                    }
-                                } else {
-                                    $AllowedItem
-                                }
-                            }
-
-                            $ExpandedBlockedTenants = foreach ($BlockedItem in $Permission.BlockedTenants) {
-                                if ($BlockedItem -is [PSCustomObject] -and $BlockedItem.type -eq 'Group') {
-                                    try {
-                                        $GroupMembers = Expand-CIPPTenantGroups -TenantFilter @($BlockedItem)
-                                        $GroupMembers | ForEach-Object { $_.addedFields.customerId }
-                                    } catch {
-                                        Write-Warning "Failed to expand blocked tenant group '$($BlockedItem.label)': $($_.Exception.Message)"
-                                        @()
-                                    }
-                                } else {
-                                    $BlockedItem
-                                }
-                            }
-
-                            if ($ExpandedAllowedTenants -contains 'AllTenants') {
-                                $ExpandedAllowedTenants = $Tenants.customerId
-                            }
-                            $ExpandedAllowedTenants | Where-Object { $ExpandedBlockedTenants -notcontains $_ }
-                        }
-                    }
-                    return $LimitedTenantList
-                }
-
+                # Tenant list and group list requests have already returned above, from the
+                # cached scope rules. Everything from here is the per-endpoint access decision.
+                # Resolve the target from the request only. Do not fall back to $env:TenantID —
+                # that is the partner/home tenant, not a customer. Missing/unmapped filters are
+                # unresolved: Test-CippRoleTenantScope returns $true (block fail-closed / allow quirk).
+                $TenantFilter = $Request.Query.tenantFilter ?? $Request.Body.tenantFilter.value ?? $Request.Body.tenantFilter ?? $Request.Query.tenantId ?? $Request.Body.tenantId.value ?? $Request.Body.tenantId
                 $TenantAllowed = $false
                 $APIAllowed = $false
+                $swPermissionEval = [System.Diagnostics.Stopwatch]::StartNew()
+
+                # Block pass: deny wins, but only when the blocking role also grants the
+                # permission and its tenant scope covers the target. Test-CippRoleTenantScope
+                # returns $true for missing/unmapped tenants — here that means fail closed (apply block).
+                foreach ($Role in $PermissionSet) {
+                    $RoleGrantsPermission = $false
+                    foreach ($Perm in $Role.Permissions) {
+                        if ($Perm -match $APIRole) {
+                            $RoleGrantsPermission = $true
+                            break
+                        }
+                    }
+                    if (-not $RoleGrantsPermission) { continue }
+                    if ($Role.BlockedEndpoints -notcontains $Request.Params.CIPPEndpoint) { continue }
+
+                    $BlockInScope = Test-CippRoleTenantScope -Role $Role -TenantFilter $TenantFilter -Tenants $Tenants -Request $Request -ApiRole $APIRole
+                    if ($BlockInScope) {
+                        throw "Access to this CIPP API endpoint is not allowed, the custom role '$($Role.Role)' has blocked this endpoint: $($Request.Params.CIPPEndpoint)"
+                    }
+                }
+
+                # Allow pass: sticky $APIAllowed preserved (permission from one role + tenant
+                # from another can still succeed). BlockedEndpoints already handled above.
                 foreach ($Role in $PermissionSet) {
                     foreach ($Perm in $Role.Permissions) {
                         if ($Perm -match $APIRole) {
@@ -254,67 +515,18 @@ function Test-CIPPAccess {
                     }
 
                     if ($APIAllowed) {
-                        $TenantFilter = $Request.Query.tenantFilter ?? $Request.Body.tenantFilter ?? $Request.Body.tenantFilter.value ?? $Request.Query.tenantId ?? $Request.Body.tenantId ?? $Request.Body.tenantId.value ?? $env:TenantID
-                        # Check tenant level access
-                        if (($Role.BlockedTenants | Measure-Object).Count -eq 0 -and $Role.AllowedTenants -contains 'AllTenants') {
-                            $TenantAllowed = $true
-                        } elseif ($TenantFilter -eq 'AllTenants') {
-                            $TenantAllowed = $false
-                        } else {
-                            $Tenant = ($Tenants | Where-Object { $TenantFilter -eq $_.customerId -or $TenantFilter -eq $_.defaultDomainName }).customerId
-
-                            # Expand allowed tenant groups to individual tenant IDs
-                            $ExpandedAllowedTenants = foreach ($AllowedItem in $Role.AllowedTenants) {
-                                if ($AllowedItem -is [PSCustomObject] -and $AllowedItem.type -eq 'Group') {
-                                    try {
-                                        $GroupMembers = Expand-CIPPTenantGroups -TenantFilter @($AllowedItem)
-                                        $GroupMembers | ForEach-Object { $_.addedFields.customerId }
-                                    } catch {
-                                        Write-Warning "Failed to expand allowed tenant group '$($AllowedItem.label)': $($_.Exception.Message)"
-                                        @()
-                                    }
-                                } else {
-                                    $AllowedItem
-                                }
-                            }
-
-                            # Expand blocked tenant groups to individual tenant IDs
-                            $ExpandedBlockedTenants = foreach ($BlockedItem in $Role.BlockedTenants) {
-                                if ($BlockedItem -is [PSCustomObject] -and $BlockedItem.type -eq 'Group') {
-                                    try {
-                                        $GroupMembers = Expand-CIPPTenantGroups -TenantFilter @($BlockedItem)
-                                        $GroupMembers | ForEach-Object { $_.addedFields.customerId }
-                                    } catch {
-                                        Write-Warning "Failed to expand blocked tenant group '$($BlockedItem.label)': $($_.Exception.Message)"
-                                        @()
-                                    }
-                                } else {
-                                    $BlockedItem
-                                }
-                            }
-
-                            if ($ExpandedAllowedTenants -contains 'AllTenants') {
-                                $AllowedTenants = $Tenants.customerId
-                            } else {
-                                $AllowedTenants = $ExpandedAllowedTenants
-                            }
-
-                            if ($Tenant) {
-                                $TenantAllowed = $AllowedTenants -contains $Tenant -and $ExpandedBlockedTenants -notcontains $Tenant
-                                if (!$TenantAllowed) { continue }
-                                break
-                            } else {
-                                $TenantAllowed = $true
-                                break
-                            }
-                        }
+                        $TenantAllowed = Test-CippRoleTenantScope -Role $Role -TenantFilter $TenantFilter -Tenants $Tenants -Request $Request -ApiRole $APIRole
+                        if (!$TenantAllowed) { continue }
+                        break
                     }
                 }
+                $swPermissionEval.Stop()
+                $AccessTimings['EvaluatePermissions'] = $swPermissionEval.Elapsed.TotalMilliseconds
 
                 if (!$APIAllowed) {
                     throw "Access to this CIPP API endpoint is not allowed, you do not have the required permission: $APIRole"
                 }
-                if (!$TenantAllowed -and $Help.Functionality -notmatch 'AnyTenant') {
+                if (!$TenantAllowed -and $Functionality -notmatch 'AnyTenant') {
                     throw 'Access to this tenant is not allowed'
                 } else {
                     return $true
@@ -322,62 +534,46 @@ function Test-CIPPAccess {
             } else {
                 # No permissions found for any roles
                 if ($TenantList.IsPresent) {
-                    return @('AllTenants')
+                    return @()
                 }
-                return $true
-                if ($APIAllowed) {
-                    $TenantFilter = $Request.Query.tenantFilter ?? $Request.Body.tenantFilter ?? $Request.Query.tenantId ?? $Request.Body.tenantId ?? $env:TenantID
-                    # Check tenant level access
-                    if (($Role.BlockedTenants | Measure-Object).Count -eq 0 -and $Role.AllowedTenants -contains 'AllTenants') {
-                        $TenantAllowed = $true
-                    } elseif ($TenantFilter -eq 'AllTenants') {
-
-                        $TenantAllowed = $false
-                    } else {
-                        $Tenant = ($Tenants | Where-Object { $TenantFilter -eq $_.customerId -or $TenantFilter -eq $_.defaultDomainName }).customerId
-
-                        if ($Role.AllowedTenants -contains 'AllTenants') {
-                            $AllowedTenants = $Tenants.customerId
-                        } else {
-                            $AllowedTenants = $Role.AllowedTenants
-                        }
-                        if ($Tenant) {
-                            $TenantAllowed = $AllowedTenants -contains $Tenant -and $Role.BlockedTenants -notcontains $Tenant
-                            if (!$TenantAllowed) { continue }
-                            break
-                        } else {
-                            $TenantAllowed = $true
-                            break
-                        }
-                    }
-                }
+                throw 'Access to this CIPP API endpoint is not allowed, the user does not have the required permission'
             }
 
-            if (!$TenantAllowed -and $Help.Functionality -notmatch 'AnyTenant') {
-
+            if (!$TenantAllowed -and $Functionality -notmatch 'AnyTenant') {
                 if (!$APIAllowed) {
                     throw "Access to this CIPP API endpoint is not allowed, you do not have the required permission: $APIRole"
                 }
-                if (!$TenantAllowed -and $Help.Functionality -notmatch 'AnyTenant') {
+                if (!$TenantAllowed -and $Functionality -notmatch 'AnyTenant') {
                     Write-Information "Tenant not allowed: $TenantFilter"
 
                     throw 'Access to this tenant is not allowed'
                 } else {
                     return $true
                 }
-
             }
         } else {
             # No permissions found for any roles
             if ($TenantList.IsPresent) {
-                return @('AllTenants')
+                return @()
             }
-            return $true
+            throw 'Access to this CIPP API endpoint is not allowed, the user does not have the required permission'
         }
+        $swUserBranch.Stop()
+        $AccessTimings['UserBranch'] = $swUserBranch.Elapsed.TotalMilliseconds
     }
 
     if ($TenantList.IsPresent) {
+        $AccessTotalSw.Stop()
+        $AccessTimings['Total'] = $AccessTotalSw.Elapsed.TotalMilliseconds
+        $AccessTimingsRounded = [ordered]@{}
+        foreach ($Key in ($AccessTimings.Keys | Sort-Object)) { $AccessTimingsRounded[$Key] = [math]::Round($AccessTimings[$Key], 2) }
+        Write-Debug "#### Access Timings #### $($AccessTimingsRounded | ConvertTo-Json -Compress)"
         return @('AllTenants')
     }
+    $AccessTotalSw.Stop()
+    $AccessTimings['Total'] = $AccessTotalSw.Elapsed.TotalMilliseconds
+    $AccessTimingsRounded = [ordered]@{}
+    foreach ($Key in ($AccessTimings.Keys | Sort-Object)) { $AccessTimingsRounded[$Key] = [math]::Round($AccessTimings[$Key], 2) }
+    Write-Debug "#### Access Timings #### $($AccessTimingsRounded | ConvertTo-Json -Compress)"
     return $true
 }

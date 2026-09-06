@@ -25,15 +25,22 @@ function New-CIPPGraphSubscription {
             # Required event types
             $EventList = [System.Collections.Generic.List[string]]@('test-created', 'granular-admin-relationship-approved')
             if (($EventType | Measure-Object).count -gt 0) {
-                foreach ($Event in $EventType) {
-                    if ($EventList -notcontains $Event) {
-                        $EventList.Add($Event)
+                foreach ($EventName in $EventType) {
+                    if ($EventList -notcontains $EventName) {
+                        $EventList.Add($EventName)
                     }
                 }
             }
 
+            if ([string]::IsNullOrWhiteSpace($BaseURL)) {
+                Write-LogMessage -headers $Headers -API $APIName -message 'Failed to create Partner Center Webhook subscription: could not determine the CIPP URL' -Sev 'Error' -tenant 'PartnerTenant'
+                return 'Failed to create Partner Center Webhook subscription: could not determine the CIPP URL'
+            }
+
+            # The URL we want registered right now, based on the URL CIPP is currently served from
+            $DesiredWebhookUrl = "https://$BaseURL/api/PublicWebhooks?CIPPID=$($CIPPID)&Type=PartnerCenter"
             $Body = [PSCustomObject]@{
-                WebhookUrl    = "https://$BaseURL/API/PublicWebhooks?CIPPID=$($CIPPID)&Type=PartnerCenter"
+                WebhookUrl    = $DesiredWebhookUrl
                 WebhookEvents = @($EventList)
             }
             try {
@@ -46,7 +53,9 @@ function New-CIPPGraphSubscription {
                 try {
                     $Existing = New-GraphGetRequest -NoAuthCheck $true -uri $Uri -tenantid $env:TenantID -scope 'https://api.partnercenter.microsoft.com/.default'
                 } catch { $Existing = $false }
-                if (!$Existing -or $Existing.webhookUrl -ne $MatchedWebhook.WebhookNotificationUrl -or $EventCompare) {
+                # Compare against the URL we want registered, not against our own stored copy - otherwise a
+                # change of CIPP hostname is never detected because both sides still hold the old URL.
+                if (!$Existing -or $Existing.webhookUrl -ne $DesiredWebhookUrl -or $EventCompare) {
                     if ($Existing.WebhookUrl) {
                         $Action = 'Updated'
                         $Method = 'PUT'
@@ -71,6 +80,19 @@ function New-CIPPGraphSubscription {
                     Write-LogMessage -headers $Headers -API $APIName -message "$Action Partner Center Webhook subscription" -Sev 'Info' -tenant 'PartnerTenant'
                     return "$Action Partner Center Webhook subscription"
                 } else {
+                    # Partner Center already points at the right URL - make sure our own record agrees
+                    if ($MatchedWebhook.WebhookNotificationUrl -ne $DesiredWebhookUrl) {
+                        $WebhookRow = @{
+                            PartitionKey           = [string]$CIPPID
+                            RowKey                 = [string]$CIPPID
+                            EventType              = [string](ConvertTo-Json -InputObject $EventList)
+                            Resource               = [string]'PartnerCenter'
+                            SubscriptionID         = [string]$MatchedWebhook.SubscriptionID
+                            Expiration             = 'Does Not Expire'
+                            WebhookNotificationUrl = [string]$DesiredWebhookUrl
+                        }
+                        $null = Add-CIPPAzDataTableEntity @WebhookTable -Entity $WebhookRow -Force
+                    }
                     Write-LogMessage -headers $Headers -API $APIName -message 'Existing Partner Center Webhook subscription found' -Sev 'Info' -tenant 'PartnerTenant'
                     return 'Existing Partner Center Webhook subscription found'
                 }
@@ -84,11 +106,11 @@ function New-CIPPGraphSubscription {
             $WebhookFilter = "PartitionKey eq '$($TenantFilter)'"
             $ExistingWebhooks = Get-CIPPAzDataTableEntity @WebhookTable -Filter $WebhookFilter
             $MatchedWebhook = $ExistingWebhooks | Where-Object { $_.Resource -eq $Resource }
-            if (($MatchedWebhook | Measure-Object).count -eq 0 -or $Recreate.IsPresent) {
+            if (($MatchedWebhook | Measure-Object).Count -eq 0 -or $Recreate.IsPresent) {
                 $expiredate = (Get-Date).AddDays(1).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
                 $params = @{
                     changeType         = $TypeofSubscription
-                    notificationUrl    = "https://$BaseURL/API/PublicWebhooks?EventType=$EventType&CIPPID=$($CIPPID)&Type=GraphSubscription"
+                    notificationUrl    = "https://$BaseURL/api/PublicWebhooks?EventType=$EventType&CIPPID=$($CIPPID)&Type=GraphSubscription"
                     resource           = $Resource
                     expirationDateTime = $expiredate
                 } | ConvertTo-Json
@@ -98,7 +120,7 @@ function New-CIPPGraphSubscription {
                 }
 
                 $GraphRequest = New-GraphPostRequest -uri 'https://graph.microsoft.com/beta/subscriptions' -tenantid $TenantFilter -type POST -body $params -verbose
-                #If creation is succesfull, we store the GUID in the storage table webhookTable to make sure we can check against this later on.
+                #If creation is successful, we store the GUID in the storage table webhookTable to make sure we can check against this later on.
                 #We store the GUID as rowkey, the event type, the resource, and the expiration date as properties, we also add the Tenant name so we can easily find this later on.
                 #We don't store the return, because Ms decided that a renewal or re-authenticate does not change the url, but does change the id...
                 $WebhookRow = @{
@@ -115,13 +137,48 @@ function New-CIPPGraphSubscription {
                 #todo: add remove webhook function, add check webhook function, add list webhooks function
                 #add refresh webhook function based on table.
                 Write-LogMessage -headers $Headers -API $APIName -message "Created Graph Webhook subscription for $($TenantFilter)" -Sev 'Info' -tenant $TenantFilter
+                return "Created Webhook subscription for $($TenantFilter)"
             } else {
+                # Check Graph directly for subscriptions matching this resource
+                $ExistingSubs = @(New-GraphGetRequest -uri 'https://graph.microsoft.com/beta/subscriptions' -tenantid $TenantFilter)
+                $MatchingSubs = @($ExistingSubs | Where-Object { $_.notificationUrl -match [regex]::Escape("https://$BaseURL/api/PublicWebhooks") -and $_.resource -eq $Resource } | Sort-Object -Property expirationDateTime -Descending)
+
+                # Keep the newest subscription, delete the rest from Graph and the table
+                $KeptSub = $MatchingSubs | Select-Object -First 1
+                $Duplicates = $MatchingSubs | Select-Object -Skip 1
+
+                foreach ($Dup in $Duplicates) {
+                    try {
+                        New-GraphPOSTRequest -uri "https://graph.microsoft.com/beta/subscriptions/$($Dup.id)" -tenantid $TenantFilter -type DELETE
+                        Write-LogMessage -headers $Headers -API $APIName -message "Deleted duplicate Graph Webhook subscription $($Dup.id) for $($TenantFilter)" -Sev 'Warning' -tenant $TenantFilter
+                    } catch {
+                        Write-LogMessage -headers $Headers -API $APIName -message "Failed to delete duplicate Graph Webhook subscription $($Dup.id): $($_.Exception.Message)" -Sev 'Warning' -tenant $TenantFilter
+                    }
+                    # Remove the corresponding table row by SubscriptionID
+                    $StaleRow = $ExistingWebhooks | Where-Object { $_.SubscriptionID -eq $Dup.id }
+                    foreach ($Row in $StaleRow) {
+                        Remove-CIPPAzDataTableEntity @WebhookTable -Entity $Row -Force
+                        Write-LogMessage -headers $Headers -API $APIName -message "Removed stale webhook table entry (RowKey $($Row.RowKey)) for $($TenantFilter)" -Sev 'Warning' -tenant $TenantFilter
+                    }
+                }
+
+                # Remove any remaining table rows whose SubscriptionID doesn't match the kept Graph subscription
+                $ExistingWebhooks | Where-Object { $KeptSub -and $_.SubscriptionID -ne $KeptSub.id } | ForEach-Object {
+                    try {
+                        Remove-CIPPAzDataTableEntity @WebhookTable -Entity $_ -Force
+                        Write-LogMessage -headers $Headers -API $APIName -message "Removed orphaned webhook table entry (RowKey $($_.RowKey)) for $($TenantFilter)" -Sev 'Warning' -tenant $TenantFilter
+                    } catch {
+                        # Entity may have already been removed in the duplicate cleanup pass
+                    }
+                }
+
                 Write-LogMessage -headers $Headers -API $APIName -message "Existing Graph Webhook subscription for $($TenantFilter) found" -Sev 'Info' -tenant $TenantFilter
+                return "Existing Webhook subscription for $($TenantFilter) found"
             }
         }
-        return "Created Webhook subscription for $($TenantFilter)"
+
     } catch {
         Write-LogMessage -headers $Headers -API $APIName -message "Failed to create Webhook Subscription: $($_.Exception.Message)" -Sev 'Error' -tenant $TenantFilter
-        Return "Failed to create Webhook Subscription for $($TenantFilter): $($_.Exception.Message)"
+        return "Failed to create Webhook Subscription for $($TenantFilter): $($_.Exception.Message)"
     }
 }

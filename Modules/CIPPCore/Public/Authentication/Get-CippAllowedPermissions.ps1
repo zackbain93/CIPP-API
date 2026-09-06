@@ -22,28 +22,10 @@ function Get-CippAllowedPermissions {
     )
 
     # Get all available permissions and base roles configuration
-
-    $CIPPCoreModuleRoot = Get-Module -Name CIPPCore | Select-Object -ExpandProperty ModuleBase
-    $CIPPRoot = (Get-Item $CIPPCoreModuleRoot).Parent.Parent
-    $Version = (Get-Content -Path $CIPPRoot\version_latest.txt).trim()
-    $BaseRoles = Get-Content -Path $CIPPRoot\Config\cipp-roles.json | ConvertFrom-Json
+    $BaseRoles = Get-Content -Path (Join-Path $env:CIPPRootPath 'Config\cipp-roles.json') | ConvertFrom-Json
     $DefaultRoles = @('superadmin', 'admin', 'editor', 'readonly', 'anonymous', 'authenticated')
 
-    $AllPermissionCacheTable = Get-CIPPTable -tablename 'cachehttppermissions'
-    $AllPermissionsRow = Get-CIPPAzDataTableEntity @AllPermissionCacheTable -Filter "PartitionKey eq 'HttpFunctions' and RowKey eq 'HttpFunctions' and Version eq '$($Version)'"
-
-    if (-not $AllPermissionsRow) {
-        $AllPermissions = Get-CIPPHttpFunctions -ByRole | Select-Object -ExpandProperty Permission
-        $Entity = @{
-            PartitionKey = 'HttpFunctions'
-            RowKey       = 'HttpFunctions'
-            Version      = [string]$Version
-            Permissions  = [string]($AllPermissions | ConvertTo-Json -Compress)
-        }
-        Add-CIPPAzDataTableEntity @AllPermissionCacheTable -Entity $Entity -Force
-    } else {
-        $AllPermissions = $AllPermissionsRow.Permissions | ConvertFrom-Json
-    }
+    $AllPermissions = Get-CippHttpPermissions
 
     $AllowedPermissions = [System.Collections.Generic.List[string]]::new()
 
@@ -70,7 +52,6 @@ function Get-CippAllowedPermissions {
 
     # For admin and superadmin: Compute permissions from base role include/exclude rules
     if ($PrimaryRole -in @('admin', 'superadmin')) {
-        Write-Information "Computing permissions for $PrimaryRole using base role rules"
 
         if ($BaseRole) {
             # Start with all permissions and apply include/exclude rules
@@ -143,7 +124,19 @@ function Get-CippAllowedPermissions {
                 }
 
                 # Restrict base permissions to only those allowed by custom roles
-                $RestrictedPermissions = $BasePermissions | Where-Object { $CustomRolePermissions -contains $_ }
+                # Include Read permissions when ReadWrite permissions are present
+                $RestrictedPermissions = $BasePermissions | Where-Object {
+                    $Permission = $_
+                    if ($CustomRolePermissions -contains $Permission) {
+                        $true
+                    } elseif ($Permission -match 'Read$') {
+                        # Check if there's a corresponding ReadWrite permission
+                        $ReadWritePermission = $Permission -replace 'Read', 'ReadWrite'
+                        $CustomRolePermissions -contains $ReadWritePermission
+                    } else {
+                        $false
+                    }
+                }
                 foreach ($Permission in $RestrictedPermissions) {
                     if ($null -ne $Permission -and $Permission -is [string]) {
                         $AllowedPermissions.Add($Permission)
@@ -161,8 +154,6 @@ function Get-CippAllowedPermissions {
     }
     # Handle users with only custom roles (no base role)
     elseif ($CustomRoles.Count -gt 0) {
-        Write-Information 'Computing permissions for custom roles only'
-
         foreach ($CustomRole in $CustomRoles) {
             try {
                 $RolePermissions = Get-CIPPRolePermissions -RoleName $CustomRole
@@ -178,5 +169,5 @@ function Get-CippAllowedPermissions {
     }
 
     # Return sorted unique permissions
-    return ($AllowedPermissions | Sort-Object -Unique)
+    return ($AllowedPermissions | Where-Object { $_ -notmatch 'None$' } | Sort-Object -Unique)
 }

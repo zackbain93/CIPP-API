@@ -1,11 +1,14 @@
 function Set-CIPPUserJITAdminProperties {
     [CmdletBinding()]
-    Param(
+    param(
         [string]$TenantFilter,
         [string]$UserId,
         [switch]$Enabled,
         $Expiration,
-        [switch]$Clear
+        $StartDate,
+        [switch]$Clear,
+        [string]$Reason,
+        [string]$CreatedBy
     )
     try {
         $Schema = Get-CIPPSchemaExtensions | Where-Object { $_.id -match '_cippUser' } | Select-Object -First 1
@@ -14,6 +17,9 @@ function Set-CIPPUserJITAdminProperties {
                 "$($Schema.id)" = @{
                     jitAdminEnabled    = $null
                     jitAdminExpiration = $null
+                    jitAdminStartDate  = $null
+                    jitAdminReason     = $null
+                    jitAdminCreatedBy  = $null
                 }
             }
         } else {
@@ -21,6 +27,9 @@ function Set-CIPPUserJITAdminProperties {
                 "$($Schema.id)" = @{
                     jitAdminEnabled    = $Enabled.IsPresent
                     jitAdminExpiration = $Expiration.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+                    jitAdminStartDate  = if ($StartDate) { $StartDate.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') } else { $null }
+                    jitAdminReason     = $Reason
+                    jitAdminCreatedBy  = $CreatedBy
                 }
             }
         }

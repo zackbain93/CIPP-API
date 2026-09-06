@@ -20,7 +20,7 @@ function Get-CippApiClient {
     }
     $Apps = Get-CIPPAzDataTableEntity @Table | Where-Object { ![string]::IsNullOrEmpty($_.RowKey) }
     $Apps = foreach ($Client in $Apps) {
-        $Client = $Client | Select-Object -Property @{Name = 'ClientId'; Expression = { $_.RowKey } }, AppName, Role, IPRange, Enabled
+        $Client = $Client | Select-Object -Property @{Name = 'ClientId'; Expression = { $_.RowKey } }, AppName, Role, IPRange, Enabled, @{Name = 'MCPAllowed'; Expression = { [bool]$_.MCPAllowed } }
 
         if (!$Client.Role) {
             $Client.Role = $null
@@ -29,8 +29,11 @@ function Get-CippApiClient {
         if ($Client.IPRange) {
             try {
                 $IPRange = @($Client.IPRange | ConvertFrom-Json -ErrorAction Stop)
-                if (($IPRange | Measure-Object).Count -eq 0) { @('Any') }
-                $Client.IPRange = $IPRange
+                if (($IPRange | Measure-Object).Count -eq 0) {
+                    $Client.IPRange = @('Any')
+                } else {
+                    $Client.IPRange = $IPRange
+                }
             } catch {
                 $Client.IPRange = @('Any')
             }

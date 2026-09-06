@@ -13,7 +13,7 @@ function Start-UpdateTokensTimer {
         $currentUTCtime = (Get-Date).ToUniversalTime()
         try {
             $Refreshtoken = (Get-GraphToken -ReturnRefresh $true).Refresh_token
-            if ($env:AzureWebJobsStorage -eq 'UseDevelopmentStorage=true') {
+            if ($env:AzureWebJobsStorage -eq 'UseDevelopmentStorage=true' -or $env:NonLocalHostAzurite -eq 'true') {
                 $Table = Get-CIPPTable -tablename 'DevSecrets'
                 $Secret = Get-CIPPAzDataTableEntity @Table -Filter "PartitionKey eq 'Secret' and RowKey eq 'Secret'"
                 if ($Secret) {
@@ -23,15 +23,9 @@ function Start-UpdateTokensTimer {
                     Write-LogMessage -API 'Update Tokens' -message 'Could not update refresh token. Will try again in 7 days.' -sev 'CRITICAL'
                 }
             } else {
-                if ($env:MSI_SECRET) {
-                    Disable-AzContextAutosave -Scope Process | Out-Null
-                    $null = Connect-AzAccount -Identity
-                    $SubscriptionId = $env:WEBSITE_OWNER_NAME -split '\+' | Select-Object -First 1
-                    $null = Set-AzContext -SubscriptionId $SubscriptionId
-                }
-                $KV = ($env:WEBSITE_DEPLOYMENT_ID -split '-')[0]
+                $KV = Get-CippKeyVaultName
                 if ($Refreshtoken) {
-                    Set-AzKeyVaultSecret -VaultName $KV -Name 'RefreshToken' -SecretValue (ConvertTo-SecureString -String $Refreshtoken -AsPlainText -Force)
+                    Set-CippKeyVaultSecret -VaultName $KV -Name 'RefreshToken' -SecretValue (ConvertTo-SecureString -String $Refreshtoken -AsPlainText -Force)
                 } else {
                     Write-LogMessage -API 'Update Tokens' -message 'Could not update refresh token. Will try again in 7 days.' -sev 'CRITICAL'
                 }
@@ -45,36 +39,66 @@ function Start-UpdateTokensTimer {
         # Check application secret expiration for $env:ApplicationId and generate a new application secret if expiration is within 30 days.
         try {
             $AppId = $env:ApplicationID
-            $PasswordCredentials = New-GraphGetRequest -uri "https://graph.microsoft.com/v1.0/applications(appId='$AppId')?`$select=id,passwordCredentials" -NoAuthCheck $true -AsApp $true -ErrorAction Stop
+            $AppRegistration = New-GraphGetRequest -uri "https://graph.microsoft.com/v1.0/applications(appId='$AppId')?`$select=id,passwordCredentials,servicePrincipalLockConfiguration" -NoAuthCheck $true -AsApp $true -ErrorAction Stop
             # sort by latest expiration date and get the first one
-            $LastPasswordCredential = $PasswordCredentials.passwordCredentials | Sort-Object -Property endDateTime -Descending | Select-Object -First 1
-            if ($LastPasswordCredential.endDateTime -lt (Get-Date).AddDays(30).ToUniversalTime()) {
+            $LastPasswordCredential = $AppRegistration.passwordCredentials | Sort-Object -Property endDateTime -Descending | Select-Object -First 1
+            $PasswordCredentials = $AppRegistration.passwordCredentials | Sort-Object -Property endDateTime -Descending
+
+            try {
+                $AppPolicyStatus = Update-AppManagementPolicy
+                Write-Information $AppPolicyStatus.PolicyAction
+            } catch {
+                Write-Warning "Error updating app management policy $($_.Exception.Message)."
+                Write-Information ($_.InvocationInfo.PositionMessage)
+            }
+
+            if ($env:CertificateAuthMode) {
+                # Certificate-exclusive mode: CIPP authenticates with the SAM certificate, so never
+                # generate a client secret. Doing so would fail on tenants blocking password addition,
+                # or silently re-create a secret on a secret-less install. The certificate is renewed below.
+                Write-Information "Certificate authentication is enabled for $AppId; skipping client secret generation."
+            } elseif ($LastPasswordCredential.endDateTime -lt (Get-Date).AddDays(30).ToUniversalTime()) {
                 Write-Information "Application secret for $AppId is expiring soon. Generating a new application secret."
-                $AppSecret = New-GraphPostRequest -uri "https://graph.microsoft.com/v1.0/applications/$($PasswordCredentials.id)/addPassword" -Body '{"passwordCredential":{"displayName":"UpdateTokens"}}' -NoAuthCheck $true -AsApp $true -ErrorAction Stop
+                $AppSecret = New-GraphPostRequest -uri "https://graph.microsoft.com/v1.0/applications/$($AppRegistration.id)/addPassword" -Body '{"passwordCredential":{"displayName":"UpdateTokens"}}' -NoAuthCheck $true -AsApp $true -ErrorAction Stop
                 Write-Information "New application secret generated for $AppId. Expiration date: $($AppSecret.endDateTime)."
             } else {
                 Write-Information "Application secret for $AppId is valid until $($LastPasswordCredential.endDateTime). No need to generate a new application secret."
             }
 
             if ($AppSecret) {
-                if ($env:AzureWebJobsStorage -eq 'UseDevelopmentStorage=true') {
-                    $Table = Get-CIPPTable -tablename 'DevSecrets'
-                    $Secret = Get-CIPPAzDataTableEntity @Table -Filter "PartitionKey eq 'Secret' and RowKey eq 'Secret'"
-                    $Secret.ApplicationSecret = $AppSecret.secretText
-                    Add-AzDataTableEntity @Table -Entity $Secret -Force
-                } else {
-                    Set-AzKeyVaultSecret -VaultName $KV -Name 'ApplicationSecret' -SecretValue (ConvertTo-SecureString -String $AppSecret.secretText -AsPlainText -Force)
+                try {
+                    if ($env:AzureWebJobsStorage -eq 'UseDevelopmentStorage=true' -or $env:NonLocalHostAzurite -eq 'true') {
+                        $Table = Get-CIPPTable -tablename 'DevSecrets'
+                        $Secret = Get-CIPPAzDataTableEntity @Table -Filter "PartitionKey eq 'Secret' and RowKey eq 'Secret'"
+                        $Secret.ApplicationSecret = $AppSecret.secretText
+                        Add-AzDataTableEntity @Table -Entity $Secret -Force
+                    } else {
+                        Set-CippKeyVaultSecret -VaultName $KV -Name 'ApplicationSecret' -SecretValue (ConvertTo-SecureString -String $AppSecret.secretText -AsPlainText -Force)
+                    }
+                    Write-LogMessage -API 'Update Tokens' -message "New application secret generated for $AppId. Expiration date: $($AppSecret.endDateTime)." -sev 'INFO'
+                } catch {
+                    # Storing the new secret failed. It exists on the app registration but not where CIPP reads
+                    # it, and as the newest credential it would suppress regeneration on the next run - leaving
+                    # the stored secret permanently stale. Roll the new secret back off the app registration so
+                    # state stays consistent and regeneration is retried on the next run.
+                    Write-LogMessage -API 'Update Tokens' -message "Failed to store new application secret for $AppId. Rolling back the generated secret, see Log Data for details. Will try again in 7 days." -sev 'CRITICAL' -LogData (Get-CippException -Exception $_)
+                    try {
+                        New-GraphPostRequest -uri "https://graph.microsoft.com/v1.0/applications/$($AppRegistration.id)/removePassword" -Body "{`"keyId`":`"$($AppSecret.keyId)`"}" -NoAuthCheck $true -AsApp $true -ErrorAction Stop
+                        Write-Information "Rolled back unstored application secret with keyId $($AppSecret.keyId)."
+                    } catch {
+                        Write-LogMessage -API 'Update Tokens' -message "Failed to roll back unstored application secret with keyId $($AppSecret.keyId) for $AppId, see Log Data for details." -sev 'CRITICAL' -LogData (Get-CippException -Exception $_)
+                    }
+                    $AppSecret = $null
                 }
-                Write-LogMessage -API 'Update Tokens' -message "New application secret generated for $AppId. Expiration date: $($AppSecret.endDateTime)." -sev 'INFO'
             }
 
             # Clean up expired application secrets
-            $ExpiredSecrets = $PasswordCredentials.passwordCredentials | Where-Object { $_.endDateTime -lt (Get-Date).ToUniversalTime() }
+            $ExpiredSecrets = $PasswordCredentials | Where-Object { $_.endDateTime -lt (Get-Date).ToUniversalTime() }
             if ($ExpiredSecrets.Count -gt 0) {
                 Write-Information "Found $($ExpiredSecrets.Count) expired application secrets for $AppId. Removing them."
                 foreach ($Secret in $ExpiredSecrets) {
                     try {
-                        New-GraphPostRequest -type DELETE -uri "https://graph.microsoft.com/v1.0/applications/$($PasswordCredentials.id)/removePassword" -Body "{`"keyId`":`"$($Secret.keyId)`"}" -NoAuthCheck $true -AsApp $true -ErrorAction Stop
+                        New-GraphPostRequest -uri "https://graph.microsoft.com/v1.0/applications/$($AppRegistration.id)/removePassword" -Body "{`"keyId`":`"$($Secret.keyId)`"}" -NoAuthCheck $true -AsApp $true -ErrorAction Stop
                         Write-Information "Removed expired application secret with keyId $($Secret.keyId)."
                     } catch {
                         Write-LogMessage -API 'Update Tokens' -message "Error removing expired application secret with keyId $($Secret.keyId), see Log Data for details." -sev 'CRITICAL' -LogData (Get-CippException -Exception $_)
@@ -83,10 +107,36 @@ function Start-UpdateTokensTimer {
             } else {
                 Write-Information "No expired application secrets found for $AppId."
             }
+
+            if (!$AppRegistration.servicePrincipalLockConfiguration.isEnabled) {
+                Write-Warning "Service principal lock configuration is not enabled for $AppId"
+                $Body = @{
+                    servicePrincipalLockConfiguration = @{
+                        isEnabled     = $true
+                        allProperties = $true
+                    }
+                } | ConvertTo-Json
+                New-GraphPOSTRequest -type PATCH -uri "https://graph.microsoft.com/v1.0/applications/$($AppRegistration.id)" -Body $Body -NoAuthCheck $true -AsApp $true -ErrorAction Stop
+                Write-Information "Service principal lock configuration has been enabled for application $AppId."
+                Write-LogMessage -API 'Update Tokens' -message "Service principal lock configuration has been enabled for application $AppId." -sev 'Info'
+            }
+
         } catch {
             Write-Warning "Error updating application secret $($_.Exception.Message)."
             Write-Information ($_.InvocationInfo.PositionMessage)
             Write-LogMessage -API 'Update Tokens' -message 'Error updating application secret, will try again in 7 days' -sev 'CRITICAL' -LogData (Get-CippException -Exception $_)
+        }
+
+        # Create or renew the SAM certificate when missing or within 30 days of expiry
+        try {
+            $CertResult = Update-CIPPSAMCertificate -ErrorAction Stop
+            if ($CertResult.Renewed) {
+                Write-Information "SAM certificate renewed. Thumbprint: $($CertResult.Thumbprint), expires: $($CertResult.NotAfter), storage mode: $($CertResult.StorageMode)"
+            }
+        } catch {
+            Write-Warning "Error updating SAM certificate $($_.Exception.Message)."
+            Write-Information ($_.InvocationInfo.PositionMessage)
+            Write-LogMessage -API 'Update Tokens' -message 'Error updating SAM certificate, will try again in 7 days' -sev 'CRITICAL' -LogData (Get-CippException -Exception $_)
         }
 
         # Get new refresh token for each direct added tenant
@@ -99,7 +149,7 @@ function Start-UpdateTokensTimer {
                 try {
                     Write-Information "Updating refresh token for tenant $($Tenant.displayName) - $($Tenant.customerId)"
                     $Refreshtoken = (Get-GraphToken -ReturnRefresh $true -TenantId $Tenant.customerId).Refresh_token
-                    if ($env:AzureWebJobsStorage -eq 'UseDevelopmentStorage=true') {
+                    if ($env:AzureWebJobsStorage -eq 'UseDevelopmentStorage=true' -or $env:NonLocalHostAzurite -eq 'true') {
                         $Table = Get-CIPPTable -tablename 'DevSecrets'
                         $Secret = Get-CIPPAzDataTableEntity @Table -Filter "PartitionKey eq 'Secret' and RowKey eq 'Secret'"
                         if ($Secret) {
@@ -113,7 +163,7 @@ function Start-UpdateTokensTimer {
                     } else {
                         if ($Refreshtoken) {
                             $name = $Tenant.customerId
-                            Set-AzKeyVaultSecret -VaultName $KV -Name $name -SecretValue (ConvertTo-SecureString -String $Refreshtoken -AsPlainText -Force)
+                            Set-CippKeyVaultSecret -VaultName $KV -Name $name -SecretValue (ConvertTo-SecureString -String $Refreshtoken -AsPlainText -Force)
                         } else {
                             Write-Warning "Could not update refresh token for tenant $($Tenant.displayName) ($($Tenant.customerId))."
                             Write-LogMessage -API 'Update Tokens' -tenant $Tenant.defaultDomainName -tenantid $Tenant.customerId -message "Could not update refresh token for tenant $($Tenant.displayName). Will try again in 7 days." -sev 'CRITICAL'

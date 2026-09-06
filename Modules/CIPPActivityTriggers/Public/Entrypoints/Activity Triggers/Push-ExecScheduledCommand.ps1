@@ -1,0 +1,512 @@
+function Push-ExecScheduledCommand {
+    <#
+    .FUNCTIONALITY
+        Entrypoint
+    #>
+    param($Item)
+    $item = $Item | ConvertTo-Json -Depth 100 | ConvertFrom-Json
+    Write-Information "We are going to be running a scheduled task: $($Item.TaskInfo | ConvertTo-Json -Depth 10)"
+
+    # Define orchestrator-based commands that handle their own post-execution and state updates
+    $OrchestratorBasedCommands = @('Invoke-CIPPOffboardingJob')
+
+    # Initialize AsyncLocal storage for thread-safe per-invocation context
+    # Store task id in CIPPCore module-scoped AsyncLocal storage so Write-LogMessage can read it -
+    # global vars are unreliable in Azure Functions
+    Set-CippScheduledTaskContext -TaskId $Item.TaskInfo.RowKey
+
+    # Store action source + creating user identity (from stored headers) for outbound User-Agent attribution
+    Set-CippUserAgentContext -Headers $Item.Parameters.Headers -Source 'scheduled-task' -TaskId $Item.TaskInfo.RowKey
+
+    $Table = Get-CippTable -tablename 'ScheduledTasks'
+    $task = $Item.TaskInfo
+    $commandParameters = $Item.Parameters | ConvertTo-Json -Depth 10 | ConvertFrom-Json -AsHashtable
+
+    # Handle tenant resolution - support both direct tenant and group-expanded tenants
+    $Tenant = $Item.Parameters.TenantFilter ?? $Item.TaskInfo.Tenant
+
+    # Detect if this is a multi-tenant task that should store results per-tenant
+    $IsMultiTenantTask = ($task.Tenant -eq 'AllTenants' -or $task.TenantGroup)
+
+    # Detect if this is an individual tenant execution within a multi-tenant task
+    # In this case, skip parent task state updates - the PostExecution function will handle it
+    $IsMultiTenantExecution = $IsMultiTenantTask -and ($Tenant -ne $task.Tenant)
+
+    # For tenant group tasks, the tenant will be the expanded tenant from the orchestrator
+    # We don't need to expand groups here as that's handled in the orchestrator
+    $TenantInfo = Get-Tenants -TenantFilter $Tenant
+
+    $CurrentTask = Get-AzDataTableEntity @Table -Filter "PartitionKey eq '$($task.PartitionKey)' and RowKey eq '$($task.RowKey)'"
+    if (!$CurrentTask) {
+        Write-Information "The task $($task.Name) for tenant $($task.Tenant) does not exist in the ScheduledTasks table. Exiting."
+        Remove-Variable -Name ScheduledTaskId -Scope Script -ErrorAction SilentlyContinue
+        return
+    }
+    if ($CurrentTask.TaskState -eq 'Completed' -and !$IsMultiTenantTask) {
+        Write-Information "The task $($task.Name) for tenant $($task.Tenant) is already completed. Skipping execution."
+        Remove-Variable -Name ScheduledTaskId -Scope Script -ErrorAction SilentlyContinue
+        return
+    }
+    # Task should be 'Pending' (queued by orchestrator) or 'Running' (retry/recovery)
+    # We accept both to handle edge cases
+
+    # NOTE: Recurring scheduled tasks intentionally have NO rerun-cache protection here.
+    # Duplicate execution is already prevented by the orchestrator's own state machine:
+    #   - the ETag claim flips the task to 'Pending' atomically (no concurrent dispatch),
+    #   - 'Pending'/'Running' tasks are not re-picked until they go stale (1h/4h),
+    #   - ScheduledTime is advanced on completion so the task isn't eligible again until due.
+    # A separate rerun cache (Test-CIPPRerun) was a second, independent clock that drifted out
+    # of sync with ScheduledTime whenever a run didn't finish advancing the schedule, which both
+    # deadlocked tasks and blocked the orchestrator's stuck-task recovery. ScheduledTime is the
+    # single source of truth.
+
+    # One-time task rerun protection based on ExecutedTime (the task's own field, not a cache)
+    if ((!$task.Recurrence -or $task.Recurrence -eq '0') -and $task.ExecutedTime -and !$IsMultiTenantExecution) {
+        $currentUnixTime = [int64](([datetime]::UtcNow) - (Get-Date '1/1/1970')).TotalSeconds
+        $timeSinceExecution = $currentUnixTime - [int64]$task.ExecutedTime
+
+        # If executed within last 15 minutes, skip (likely a duplicate pickup)
+        if ($timeSinceExecution -lt 900) {
+            Write-Information "One-time task $($task.Name) for tenant $Tenant was recently executed ($timeSinceExecution seconds ago). Skipping to prevent duplicate execution."
+            Remove-Variable -Name ScheduledTaskId -Scope Script -ErrorAction SilentlyContinue
+            return
+        }
+    }
+
+    if ($task.Trigger) {
+        # Extract trigger data from the task and process
+        $Trigger = if (Test-Json -Json $task.Trigger) { $task.Trigger | ConvertFrom-Json } else { $task.Trigger }
+        $TriggerType = $Trigger.Type.value ?? $Trigger.Type
+        if ($TriggerType -eq 'DeltaQuery') {
+            $IsTriggerTask = $true
+
+            #if recurrence is just a number, add it in days.
+            if ($task.Recurrence -match '^\d+$') {
+                $task.Recurrence = $task.Recurrence + 'd'
+            }
+            $secondsToAdd = switch -Regex ($task.Recurrence) {
+                '(\d+)m$' { [int64]$matches[1] * 60 }
+                '(\d+)h$' { [int64]$matches[1] * 3600 }
+                '(\d+)d$' { [int64]$matches[1] * 86400 }
+                default { 0 }
+            }
+
+            $Minutes = [int]($secondsToAdd / 60)
+
+            # Without this a throw here escapes the entrypoint, leaving the task on the orchestrator's
+            # 'Pending' claim with nothing recorded, to be re-picked as a stale claim every hour.
+            try {
+                $DeltaUrl = Get-DeltaQueryUrl -TenantFilter $Tenant -PartitionKey $task.RowKey
+                $DeltaQuery = @{
+                    DeltaUrl     = $DeltaUrl
+                    TenantFilter = $Tenant
+                    PartitionKey = $task.RowKey
+                }
+                $Query = New-GraphDeltaQuery @DeltaQuery
+
+                $DeltaQueryConditions = @{
+                    Query        = $Query
+                    Trigger      = $Trigger
+                    TenantFilter = $Tenant
+                    LastTrigger  = [datetime]::UtcNow.AddMinutes(-$Minutes)
+                }
+                $DeltaResults = Test-DeltaQueryConditions @DeltaQueryConditions
+            } catch {
+                $ExceptionData = Get-CippException -Exception $_
+                if (!$IsMultiTenantExecution) {
+                    if ($secondsToAdd -gt 0) {
+                        $unixtimeNow = [int64](([datetime]::UtcNow) - (Get-Date '1/1/1970')).TotalSeconds
+                        if ([int64]$task.ScheduledTime -lt ($unixtimeNow - $secondsToAdd)) {
+                            $task.ScheduledTime = $unixtimeNow
+                        }
+                    }
+                    $null = Update-AzDataTableEntity -Force @Table -Entity @{
+                        PartitionKey  = $task.PartitionKey
+                        RowKey        = $task.RowKey
+                        Results       = "$($ExceptionData.NormalizedError)"
+                        ScheduledTime = [string]([int64]$task.ScheduledTime + [int64]$secondsToAdd)
+                        TaskState     = $secondsToAdd -gt 0 ? 'Failed - Planned' : 'Failed'
+                    }
+                }
+                Write-LogMessage -API 'Scheduler_UserTasks' -tenant $Tenant -tenantid $TenantInfo.customerId -message "Failed to evaluate the delta query trigger for task $($task.Name): $($ExceptionData.NormalizedError)" -sev Error -LogData $ExceptionData
+                Remove-Variable -Name ScheduledTaskId -Scope Script -ErrorAction SilentlyContinue
+                return
+            }
+
+            if (-not $DeltaResults.ConditionsMet) {
+                Write-Information "Delta query conditions not met for tenant $Tenant. Skipping execution."
+                # update interval
+                $nextRunUnixTime = [int64]$task.ScheduledTime + [int64]$secondsToAdd
+                $null = Update-AzDataTableEntity -Force @Table -Entity @{
+                    PartitionKey  = $task.PartitionKey
+                    RowKey        = $task.RowKey
+                    TaskState     = 'Planned'
+                    ScheduledTime = [string]$nextRunUnixTime
+                }
+                Remove-Variable -Name ScheduledTaskId -Scope Script -ErrorAction SilentlyContinue
+                return
+            }
+        }
+    } else {
+        $IsTriggerTask = $false
+    }
+
+    # Only update parent task state if this is NOT a multi-tenant execution
+    # Multi-tenant executions have their parent state managed by PostExecution
+    if (!$IsMultiTenantExecution) {
+        $null = Update-AzDataTableEntity -Force @Table -Entity @{
+            PartitionKey = $task.PartitionKey
+            RowKey       = $task.RowKey
+            TaskState    = 'Running'
+        }
+    }
+
+    $Command = Get-Command -Name $Item.Command -ErrorAction SilentlyContinue
+    if ($null -eq $Command) {
+        $Results = "Task Failed: The command $($Item.Command) does not exist."
+        $State = 'Failed'
+        if (!$IsMultiTenantExecution) {
+            Update-AzDataTableEntity -Force @Table -Entity @{
+                PartitionKey = $task.PartitionKey
+                RowKey       = $task.RowKey
+                Results      = "$Results"
+                TaskState    = $State
+            }
+        }
+
+        Write-LogMessage -API 'Scheduler_UserTasks' -tenant $Tenant -tenantid $TenantInfo.customerId -message "Failed to execute task $($task.Name): The command $($Item.Command) does not exist." -sev Error
+        Remove-Variable -Name ScheduledTaskId -Scope Script -ErrorAction SilentlyContinue
+        return
+    }
+
+    if ($Command.Module -notin @('CIPPCore', 'CIPPAlerts', 'CIPPStandards', 'CIPPTests', 'CIPPDB', 'CippExtensions', 'CIPPActivityTriggers')) {
+        $State = 'Failed'
+        Write-LogMessage -headers $Headers -API 'ScheduledTask' -message "Blocked attempt to schedule command from unauthorized module: $($Command.ModuleName)\$($Item.Command)" -Sev 'Warning'
+        $Results = "Task blocked: The command '$($Item.Command)' is not permitted to run as a scheduled task."
+        if (!$IsMultiTenantExecution) {
+            Update-AzDataTableEntity -Force @Table -Entity @{
+                PartitionKey = $task.PartitionKey
+                RowKey       = $task.RowKey
+                Results      = "$Results"
+                TaskState    = $State
+            }
+        }
+        Remove-Variable -Name ScheduledTaskId -Scope Script -ErrorAction SilentlyContinue
+        return
+    }
+    if ($Item.Command -in (Get-CIPPSchedulerBlockedCommands)) {
+        $Results = "Task blocked: '$($Item.Command)' is not permitted to run as a scheduled task."
+        $State = 'Failed'
+        Write-LogMessage -API 'Scheduler_UserTasks' -tenant $Tenant -tenantid $TenantInfo.customerId -message "Blocked execution of restricted command '$($Item.Command)' in task $($task.Name)" -sev Warning
+        if (!$IsMultiTenantExecution) {
+            Update-AzDataTableEntity -Force @Table -Entity @{
+                PartitionKey = $task.PartitionKey
+                RowKey       = $task.RowKey
+                Results      = "$Results"
+                TaskState    = $State
+            }
+        }
+        Remove-Variable -Name ScheduledTaskId -Scope Script -ErrorAction SilentlyContinue
+        return
+    }
+
+    $Function = $Command
+
+    try {
+        $PossibleParams = $Function.Parameters.Keys
+        $keysToRemove = [System.Collections.Generic.List[string]]@()
+        foreach ($key in $commandParameters.Keys) {
+            if (-not ($PossibleParams -contains $key)) {
+                $keysToRemove.Add($key)
+            }
+        }
+        foreach ($key in $keysToRemove) {
+            $commandParameters.Remove($key)
+        }
+    } catch {
+        Write-Information "Failed to remove parameters: $($_.Exception.Message)"
+    }
+
+    # Stored parameters are user input: the command's tenant parameter is forced to the authorized
+    # task tenant so a stored value can never target another tenant. When a command declares more
+    # than one tenant-identifying name, only the most specific one is injected and the others are
+    # dropped so the command resolves them itself.
+    $DeclaredTenantParams = [array](@('TenantFilter', 'Tenant', 'TenantId') | Where-Object { $Function.Parameters.ContainsKey($_) })
+    foreach ($TenantParamName in $DeclaredTenantParams) {
+        $StoredTenantValue = $commandParameters[$TenantParamName]
+        $StoredTenantString = [string]($StoredTenantValue.value ?? $StoredTenantValue)
+        if (![string]::IsNullOrWhiteSpace($StoredTenantString) -and $StoredTenantString -ne [string]$Tenant) {
+            Write-LogMessage -API 'Scheduler_UserTasks' -tenant $Tenant -tenantid $TenantInfo.customerId -message "Task $($task.Name): stored parameter -$TenantParamName value '$StoredTenantString' does not match the authorized tenant '$Tenant' and was overridden." -sev Error
+        }
+        if ($TenantParamName -eq $DeclaredTenantParams[0]) {
+            $commandParameters[$TenantParamName] = $Tenant
+        } else {
+            $commandParameters.Remove($TenantParamName)
+        }
+    }
+
+    if ($IsTriggerTask -eq $true -and $Trigger.ExecutePerResource -ne $true) {
+        # iterate through paramters looking for %variables% and replace them with matched data from the delta query
+        # examples would be %id% to be the id of the result
+        # if %triggerdata% is found, pass the entire matched data object
+        try {
+            foreach ($key in $commandParameters.Keys) {
+                if ($commandParameters[$key] -is [string]) {
+                    if ($commandParameters[$key] -match '^%(.*)%$') {
+                        $variableName = $matches[1]
+                        if ($variableName -eq 'triggerdata') {
+                            Write-Information "Replacing parameter $key with full matched data object."
+                            $commandParameters[$key] = $DeltaResults.MatchedData
+                        } else {
+                            # Replace with array of matched property values
+                            Write-Information "Replacing parameter $key with matched data property '$variableName'."
+                            $commandParameters[$key] = $DeltaResults.MatchedData | Select-Object -ExpandProperty $variableName
+                        }
+                    }
+                }
+            }
+        } catch {
+            Write-Information "Failed to process trigger data parameters: $($_.Exception.Message)"
+        }
+    } elseif ($IsTriggerTask -eq $true -and $Trigger.ExecutePerResource -eq $true) {
+        Write-Information 'This is a trigger task with ExecutePerResource set to true. Iterating through matched data to execute command per resource.'
+        $results = foreach ($dataItem in $DeltaResults.MatchedData) {
+            $individualCommandParameters = $commandParameters.Clone()
+            try {
+                foreach ($key in $individualCommandParameters.Keys) {
+                    if ($individualCommandParameters[$key] -is [string]) {
+                        if ($individualCommandParameters[$key] -match '^%(.*)%$') {
+                            if ($matches[1] -eq 'triggerdata') {
+                                Write-Information "Replacing parameter $key with full matched data object for individual execution."
+                                $individualCommandParameters[$key] = $dataItem
+                            } else {
+                                $variableName = $matches[1]
+                                Write-Information "Replacing parameter $key with matched data property '$variableName' for individual execution."
+                                $individualCommandParameters[$key] = $dataItem.$variableName
+                            }
+                        }
+                    }
+                }
+            } catch {
+                Write-Information "Failed to process trigger data parameters for individual execution: $($_.Exception.Message)"
+            }
+            try {
+                Write-Information "Executing command $($Item.Command) for individual matched data item with parameters: $($individualCommandParameters | ConvertTo-Json -Depth 10)"
+                & $Item.Command @individualCommandParameters
+                Write-Information "Results for individual execution: $($results | ConvertTo-Json -Depth 10)"
+            } catch {
+                Write-Information "Failed to execute command for individual matched data item: $($_.Exception.Message)"
+            }
+        }
+    }
+
+    try {
+        if (-not $Trigger.ExecutePerResource) {
+            try {
+                # For orchestrator-based commands, add TaskInfo to enable post-execution updates
+                if ($Item.Command -eq 'Invoke-CIPPOffboardingJob') {
+                    Write-Information 'Adding TaskInfo to command parameters for orchestrator-based offboarding'
+                    $commandParameters['TaskInfo'] = $task
+                }
+
+                Write-Information "Starting task: $($Item.Command) for tenant: $Tenant with parameters: $($commandParameters | ConvertTo-Json -Depth 10)"
+                $results = & $Item.Command @commandParameters
+            } catch {
+                $results = "Task Failed: $($_.Exception.Message)"
+                $State = 'Failed'
+            }
+            Write-Information 'Ran the command. Processing results'
+        }
+
+        # Extract TaskAttachments from structured output before general result processing
+        $TaskAttachments = $null
+        if ($results -is [hashtable] -and $results.ContainsKey('TaskAttachments')) {
+            $TaskAttachments = $results.TaskAttachments
+            $results = $results.Results
+        } elseif ($results -is [PSCustomObject] -and $null -ne $results.TaskAttachments) {
+            $TaskAttachments = $results.TaskAttachments
+            $results = $results.Results
+        }
+
+        Write-Information "Results: $($results | ConvertTo-Json -Depth 10)"
+        if ($item.command -like 'Get-CIPPAlert*') {
+            Write-Information 'This is an alert task. Processing results as alerts.'
+            $results = @($results)
+            $TaskType = 'Alert'
+        } else {
+            Write-Information 'This is a scheduled task. Processing results as scheduled task.'
+            $TaskType = 'Scheduled Task'
+
+            if (!$results) {
+                $results = 'Task completed successfully'
+            }
+
+            if ($results -is [String]) {
+                $results = @{ Results = $results }
+            } elseif ($results -is [array] -and $results[0] -is [string] -or $results[0].resultText -is [string]) {
+                $results = $results | Where-Object { $_ -is [string] -or $_.resultText -is [string] }
+                $results = $results | ForEach-Object {
+                    $Message = $_.resultText ?? $_
+                    @{ Results = $Message }
+                }
+            }
+            Write-Information "Results after processing: $($results | ConvertTo-Json -Depth 10)"
+            Write-Information 'Moving onto storing results'
+            if ($results -is [string]) {
+                $StoredResults = $results
+            } else {
+                $results = $results | Select-Object * -ExcludeProperty RowKey, PartitionKey
+                $StoredResults = $results | ConvertTo-Json -Compress -Depth 20 | Out-String
+            }
+        }
+        Write-Information "Results: $($results | ConvertTo-Json -Depth 10)"
+        if ($StoredResults.Length -gt 64000 -or $IsMultiTenantTask) {
+            $TaskResultsTable = Get-CippTable -tablename 'ScheduledTaskResults'
+            $TaskResults = @{
+                PartitionKey = $task.RowKey
+                RowKey       = $Tenant
+                Results      = [string](ConvertTo-Json -Compress -Depth 20 $results)
+            }
+            $null = Add-CIPPAzDataTableEntity @TaskResultsTable -Entity $TaskResults -Force
+            $StoredResults = @{ Results = 'Completed, details are available in the More Info pane' } | ConvertTo-Json -Compress
+        }
+    } catch {
+        Write-Information "Failed to run task: $($_.Exception.Message)"
+        # Captured before anything else can overwrite $_. Get-NormalizedError unwraps a JSON Graph or
+        # Exchange error body and returns the original string when it recognises nothing, so this is
+        # never less informative than the raw exception message it replaced.
+        $ExceptionData = Get-CippException -Exception $_
+        $errorMessage = $ExceptionData.NormalizedError
+        #if recurrence is just a number, add it in days.
+        if ($task.Recurrence -match '^\d+$') {
+            $task.Recurrence = $task.Recurrence + 'd'
+        }
+        $secondsToAdd = switch -Regex ($task.Recurrence) {
+            '(\d+)m$' { [int64]$matches[1] * 60 }
+            '(\d+)h$' { [int64]$matches[1] * 3600 }
+            '(\d+)d$' { [int64]$matches[1] * 86400 }
+            default { 0 }
+        }
+
+        if ($secondsToAdd -gt 0) {
+            $unixtimeNow = [int64](([datetime]::UtcNow) - (Get-Date '1/1/1970')).TotalSeconds
+            if ([int64]$task.ScheduledTime -lt ($unixtimeNow - $secondsToAdd)) {
+                $task.ScheduledTime = $unixtimeNow
+            }
+        }
+
+        $nextRunUnixTime = [int64]$task.ScheduledTime + [int64]$secondsToAdd
+        if ($task.Recurrence -ne 0) { $State = 'Failed - Planned' } else { $State = 'Failed' }
+        Write-Information "The job is recurring, but failed. It was scheduled for $($task.ScheduledTime). The next runtime should be $nextRunUnixTime"
+        if (!$IsMultiTenantExecution) {
+            Update-AzDataTableEntity -Force @Table -Entity @{
+                PartitionKey  = $task.PartitionKey
+                RowKey        = $task.RowKey
+                Results       = "$errorMessage"
+                ScheduledTime = "$nextRunUnixTime"
+                TaskState     = $State
+            }
+        }
+        Write-LogMessage -API 'Scheduler_UserTasks' -tenant $Tenant -tenantid $TenantInfo.customerId -message "Failed to execute task $($task.Name): $errorMessage" -sev Error -LogData $ExceptionData
+    }
+
+    # For orchestrator-based commands, skip post-execution alerts as they will be handled by the orchestrator's post-execution function
+    if ($Results -and $Item.Command -notin $OrchestratorBasedCommands -and -not [string]::IsNullOrWhiteSpace($Task.PostExecution)) {
+        Write-Information "Sending task results to post execution target(s): $($Task.PostExecution -join ', ')."
+        $AlertParams = @{
+            Results      = $Results
+            TaskInfo     = $task
+            TenantFilter = $Tenant
+            TaskType     = $TaskType
+        }
+        if ($TaskAttachments) {
+            $AlertParams.Attachments = $TaskAttachments
+        }
+        $PostExecutionResults = @(Send-CIPPScheduledTaskAlert @AlertParams)
+        # Keep the delivery outcomes with the task, so a failed webhook, email or PSA note shows on the task page.
+        try {
+            $TaskTable = Get-CippTable -tablename 'ScheduledTasks'
+            $null = Update-AzDataTableEntity -Force @TaskTable -Entity @{
+                PartitionKey         = $task.PartitionKey
+                RowKey               = $task.RowKey
+                PostExecutionResults = [string](ConvertTo-Json -Compress -Depth 5 -InputObject $PostExecutionResults)
+            }
+        } catch {
+            Write-Information "Could not store the post-execution results: $($_.Exception.Message)"
+        }
+    }
+
+    try {
+        # For orchestrator-based commands, skip task state update as it will be handled by post-execution
+        if ($Item.Command -in $OrchestratorBasedCommands) {
+            Write-Information "Command $($Item.Command) is orchestrator-based. Skipping task state update - will be handled by post-execution."
+            if (!$IsMultiTenantExecution) {
+                if ($State -eq 'Failed') {
+                    # The orchestrator command itself failed to dispatch - record the failure so the task isn't lost
+                    Update-AzDataTableEntity -Force @Table -Entity @{
+                        PartitionKey = $task.PartitionKey
+                        RowKey       = $task.RowKey
+                        Results      = "$results"
+                        TaskState    = 'Failed'
+                    }
+                } else {
+                    # Update task state to 'Processing' to indicate orchestration is in progress
+                    Update-AzDataTableEntity -Force @Table -Entity @{
+                        PartitionKey = $task.PartitionKey
+                        RowKey       = $task.RowKey
+                        Results      = 'Orchestration in progress'
+                        TaskState    = 'Processing'
+                    }
+                }
+            }
+        } elseif ($IsMultiTenantExecution) {
+            # For multi-tenant executions, skip parent task state updates
+            # The PostExecution function will aggregate all results and update the parent task
+            Write-Information "Multi-tenant execution for tenant $Tenant - parent task state will be updated by PostExecution"
+        } elseif ($task.Recurrence -eq '0' -or [string]::IsNullOrEmpty($task.Recurrence) -or $Trigger.ExecutionMode.value -eq 'once' -or $Trigger.ExecutionMode -eq 'once') {
+            Write-Information 'Recurrence empty or 0. Task is not recurring. Setting task state to completed.'
+            Update-AzDataTableEntity -Force @Table -Entity @{
+                PartitionKey = $task.PartitionKey
+                RowKey       = $task.RowKey
+                Results      = "$StoredResults"
+                TaskState    = 'Completed'
+            }
+        } else {
+            #if recurrence is just a number, add it in days.
+            if ($task.Recurrence -match '^\d+$') {
+                $task.Recurrence = $task.Recurrence + 'd'
+            }
+            $secondsToAdd = switch -Regex ($task.Recurrence) {
+                '(\d+)m$' { [int64]$matches[1] * 60 }
+                '(\d+)h$' { [int64]$matches[1] * 3600 }
+                '(\d+)d$' { [int64]$matches[1] * 86400 }
+                default { 0 }
+            }
+
+            if ($secondsToAdd -gt 0) {
+                $unixtimeNow = [int64](([datetime]::UtcNow) - (Get-Date '1/1/1970')).TotalSeconds
+                if ([int64]$task.ScheduledTime -lt ($unixtimeNow - $secondsToAdd)) {
+                    $task.ScheduledTime = $unixtimeNow
+                }
+            }
+
+            $nextRunUnixTime = [int64]$task.ScheduledTime + [int64]$secondsToAdd
+            Write-Information "The job is recurring. It was scheduled for $($task.ScheduledTime). The next runtime should be $nextRunUnixTime"
+            Update-AzDataTableEntity -Force @Table -Entity @{
+                PartitionKey  = $task.PartitionKey
+                RowKey        = $task.RowKey
+                Results       = "$StoredResults"
+                TaskState     = 'Planned'
+                ScheduledTime = "$nextRunUnixTime"
+            }
+        }
+    } catch {
+        Write-Warning "Failed to update task state: $($_.Exception.Message)"
+        Write-Information $_.InvocationInfo.PositionMessage
+    }
+    if ($TaskType -ne 'Alert') {
+        Write-LogMessage -API 'Scheduler_UserTasks' -tenant $Tenant -tenantid $TenantInfo.customerId -message "Successfully executed task: $($task.Name)" -sev Info
+    }
+    Remove-Variable -Name ScheduledTaskId -Scope Script -ErrorAction SilentlyContinue
+    return 'Task Completed Successfully.'
+}

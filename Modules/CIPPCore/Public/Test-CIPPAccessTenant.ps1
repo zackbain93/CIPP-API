@@ -17,8 +17,14 @@ function Test-CIPPAccessTenant {
         @{ Name = 'SharePoint Administrator'; Id = 'f28a1f50-f6e7-4571-818b-6a12f2af6b6c' },
         @{ Name = 'Authentication Policy Administrator'; Id = '0526716b-113d-4c15-b2c8-68e3c22b9f80' },
         @{ Name = 'Privileged Role Administrator'; Id = 'e8611ab8-c189-46e8-94e1-60213ab1f814' },
-        @{ Name = 'Privileged Authentication Administrator'; Id = '7be44c8a-adaf-4e2a-84d6-ab2649e08a13' }
+        @{ Name = 'Privileged Authentication Administrator'; Id = '7be44c8a-adaf-4e2a-84d6-ab2649e08a13' },
+        @{ Name = 'Billing Administrator'; Id = 'b0f54661-2d74-4c50-afa3-1ec803f12efe'; Optional = $true },
+        @{ Name = 'Global Reader'; Id = 'f2ef992c-3afb-46b9-b7cf-a126ee74c451'; Optional = $true },
+        @{ Name = 'Domain Name Administrator'; Id = '8329153b-31d0-4727-b945-745eb3bc5f31'; Optional = $true }
     )
+
+    # Global Administrator implicitly grants every role listed above.
+    $GlobalAdminRoleId = '62e90394-69f5-4237-9190-012177145e10'
 
     $TenantParams = @{
         IncludeErrors = $true
@@ -37,7 +43,7 @@ function Test-CIPPAccessTenant {
             OrchestratorName = 'CippAccessTenantTest'
             SkipLog          = $true
         }
-        $null = Start-NewOrchestration -FunctionName CIPPOrchestrator -InputObject ($InputObject | ConvertTo-Json -Depth 10)
+        $null = Start-CIPPOrchestrator -InputObject $InputObject
         $Results = "Queued $($TenantList.Count) tenants for access checks"
 
     } else {
@@ -47,13 +53,20 @@ function Test-CIPPAccessTenant {
         $GraphStatus = $false
         $ExchangeStatus = $false
 
+        # Direct tenants authenticate with their own per-tenant refresh token rather than through a
+        # GDAP relationship, so directory roles granted to the partner tenant do not apply to them.
+        $IsDirectTenant = $Tenant.delegatedPrivilegeStatus -eq 'directTenant'
+        $TenantType = if ($IsDirectTenant) { 'Direct' } else { 'GDAP' }
+
         $Results = [PSCustomObject]@{
             TenantName                = $Tenant.defaultDomainName
+            TenantType                = $TenantType
+            ServiceAccount            = ''
             GraphStatus               = $false
             GraphTest                 = ''
             ExchangeStatus            = $false
             ExchangeTest              = ''
-            GDAPRoles                 = ''
+            AssignedRoles             = ''
             MissingRoles              = ''
             OrgManagementRoles        = @()
             OrgManagementRolesMissing = @()
@@ -63,39 +76,89 @@ function Test-CIPPAccessTenant {
         $AddedText = ''
         try {
             $TenantId = $Tenant.customerId
-            $BulkRequests = $ExpectedRoles | ForEach-Object { @(
-                    @{
-                        id     = "roleManagement_$($_.Id)"
-                        method = 'GET'
-                        url    = "roleManagement/directory/roleAssignments?`$filter=roleDefinitionId eq '$($_.Id)'&`$expand=principal"
-                    }
-                )
-            }
-            $GDAPRolesGraph = New-GraphBulkRequest -tenantid $TenantId -Requests $BulkRequests
-            $GDAPRoles = [System.Collections.Generic.List[object]]::new()
+            $AssignedRoles = [System.Collections.Generic.List[object]]::new()
             $MissingRoles = [System.Collections.Generic.List[object]]::new()
 
-            foreach ($RoleId in $ExpectedRoles) {
-                $GraphRole = $GDAPRolesGraph.body.value | Where-Object -Property roleDefinitionId -EQ $RoleId.Id
-                $Role = $GraphRole.principal | Where-Object -Property organizationId -EQ $env:TenantID
+            if ($IsDirectTenant) {
+                # A direct tenant is reached with the service account's own delegated token, so the
+                # roles that matter are the ones that account holds inside the tenant itself rather
+                # than anything assigned to the partner tenant.
+                $ServiceAccount = New-GraphGetRequest -uri 'https://graph.microsoft.com/v1.0/me?$select=id,displayName,userPrincipalName' -tenantid $TenantId -ErrorAction Stop
+                $Results.ServiceAccount = $ServiceAccount.userPrincipalName
 
-                if (!$Role) {
-                    $MissingRoles.Add(
-                        [PSCustomObject]@{
-                            Name = $RoleId.Name
-                            Type = 'Tenant'
+                $Memberships = New-GraphGetRequest -uri 'https://graph.microsoft.com/v1.0/me/transitiveMemberOf' -tenantid $TenantId -ErrorAction Stop
+                $DirectoryRoles = @($Memberships | Where-Object { $_.'@odata.type' -eq '#microsoft.graph.directoryRole' })
+                $IsGlobalAdmin = $DirectoryRoles.roleTemplateId -contains $GlobalAdminRoleId
+
+                foreach ($RoleId in $ExpectedRoles) {
+                    $HeldRole = $DirectoryRoles | Where-Object { $_.roleTemplateId -eq $RoleId.Id }
+                    if ($HeldRole) {
+                        $AssignedRoles.Add([PSCustomObject]@{
+                                Role  = $RoleId.Name
+                                Group = $ServiceAccount.userPrincipalName
+                            })
+                    } elseif ($IsGlobalAdmin) {
+                        $AssignedRoles.Add([PSCustomObject]@{
+                                Role  = $RoleId.Name
+                                Group = "$($ServiceAccount.userPrincipalName) (via Global Administrator)"
+                            })
+                    } else {
+                        $MissingRoles.Add(
+                            [PSCustomObject]@{
+                                Name     = $RoleId.Name
+                                Type     = 'Tenant'
+                                Optional = $RoleId.Optional
+                            }
+                        )
+                    }
+                }
+
+                $RequiredMissingRoles = $MissingRoles | Where-Object { $_.Optional -ne $true }
+                if (($RequiredMissingRoles | Measure-Object).Count -gt 0) {
+                    $AddedText = 'but the service account is missing required roles'
+                } elseif (($MissingRoles | Measure-Object).Count -gt 0) {
+                    $AddedText = 'but the service account is missing optional roles'
+                }
+            } else {
+                $BulkRequests = $ExpectedRoles | ForEach-Object { @(
+                        @{
+                            id     = "roleManagement_$($_.Id)"
+                            method = 'GET'
+                            url    = "roleManagement/directory/roleAssignments?`$filter=roleDefinitionId eq '$($_.Id)'&`$expand=principal"
                         }
                     )
-                    $AddedText = 'but missing GDAP roles'
-                } else {
-                    $GDAPRoles.Add([PSCustomObject]@{
-                            Role  = $RoleId.Name
-                            Group = $Role.displayName
-                        })
+                }
+                $GDAPRolesGraph = New-GraphBulkRequest -tenantid $TenantId -Requests $BulkRequests
+
+                foreach ($RoleId in $ExpectedRoles) {
+                    $GraphRole = $GDAPRolesGraph.body.value | Where-Object -Property roleDefinitionId -EQ $RoleId.Id
+                    $Role = $GraphRole.principal | Where-Object -Property organizationId -EQ $env:TenantID
+
+                    if (!$Role) {
+                        $MissingRoles.Add(
+                            [PSCustomObject]@{
+                                Name     = $RoleId.Name
+                                Type     = 'Tenant'
+                                Optional = $RoleId.Optional
+                            }
+                        )
+                    } else {
+                        $AssignedRoles.Add([PSCustomObject]@{
+                                Role  = $RoleId.Name
+                                Group = $Role.displayName
+                            })
+                    }
+                }
+
+                $RequiredMissingRoles = $MissingRoles | Where-Object { $_.Optional -ne $true }
+                if (($RequiredMissingRoles | Measure-Object).Count -gt 0) {
+                    $AddedText = 'but missing required GDAP roles'
+                } elseif (($MissingRoles | Measure-Object).Count -gt 0) {
+                    $AddedText = 'but missing optional GDAP roles'
                 }
             }
 
-            $GraphTest = "Successfully connected to Graph $($AddedText)"
+            $GraphTest = "Successfully connected to Graph $($AddedText)".Trim()
             $GraphStatus = $true
         } catch {
             $ErrorMessage = Get-CippException -Exception $_
@@ -103,46 +166,62 @@ function Test-CIPPAccessTenant {
             Write-LogMessage -headers $Headers -API $APINAME -tenant $tenant.defaultDomainName -message "Tenant access check failed: $($ErrorMessage.NormalizedError) " -Sev 'Error' -LogData $ErrorMessage
         }
 
+        $ExchangeLicenseCapable = $true
+        $ExchangeSkippedByLicense = $false
         try {
-            $null = New-ExoRequest -tenantid $Tenant.customerId -cmdlet 'Get-OrganizationConfig' -ErrorAction Stop
-
-            $OrgManagementRoles = New-ExoRequest -tenantid $Tenant.customerId -cmdlet 'Get-ManagementRoleAssignment' -cmdParams @{ Delegating = $false } | Where-Object { $_.RoleAssigneeName -eq 'Organization Management' } | Select-Object -Property Role, Guid
-            Write-Information "Found $($OrgManagementRoles.Count) Organization Management roles in Exchange"
-            $Results.OrgManagementRoles = $OrgManagementRoles
-
-            $RoleDefinitions = New-GraphGetRequest -tenantid $Tenant.customerId -uri 'https://graph.microsoft.com/beta/roleManagement/exchange/roleDefinitions'
-            Write-Information "Found $($RoleDefinitions.Count) Exchange role definitions"
-
-            $BasePath = Get-Module -Name 'CIPPCore' | Select-Object -ExpandProperty ModuleBase
-            $AllOrgManagementRoles = Get-Content -Path "$BasePath\Public\OrganizationManagementRoles.json" -ErrorAction Stop | ConvertFrom-Json
-            Write-Information "Loaded all Organization Management roles from $BasePath\Public\OrganizationManagementRoles.json"
-
-            $AvailableRoles = $RoleDefinitions | Where-Object -Property displayName -In $AllOrgManagementRoles | Select-Object -Property displayName, id, description
-            Write-Information "Found $($AvailableRoles.Count) available Organization Management roles in Exchange"
-            $MissingOrgMgmtRoles = $AvailableRoles | Where-Object { $OrgManagementRoles.Role -notcontains $_.displayName }
-            if (($MissingOrgMgmtRoles | Measure-Object).Count -gt 0) {
-                $Results.OrgManagementRolesMissing = $MissingOrgMgmtRoles
-                Write-Warning "Found $($MissingRoles.Count) missing Organization Management roles in Exchange"
-                $ExchangeStatus = $false
-                $ExchangeTest = 'Connected to Exchange but missing permissions in Organization Management. This may impact the ability to manage Exchange features'
-                Write-LogMessage -headers $Headers -API $APINAME -tenant $tenant.defaultDomainName -message 'Tenant access check for Exchange failed: Missing Organization Management roles' -Sev 'Warning' -LogData $MissingOrgMgmtRoles
-            } else {
-                Write-Warning 'All available Organization Management roles are present in Exchange'
-                $ExchangeStatus = $true
-                $ExchangeTest = 'Successfully connected to Exchange'
-            }
+            $ExchangeLicenseCapable = Test-CIPPStandardLicense -StandardName 'ExchangeAccessCheck' -TenantFilter $Tenant.customerId -Preset Exchange -SkipLog
         } catch {
             $ErrorMessage = Get-CippException -Exception $_
-            $ReportedError = ($_.ErrorDetails | ConvertFrom-Json -ErrorAction SilentlyContinue)
-            $Message = if ($ReportedError.error.details.message) { $ReportedError.error.details.message } else { $ReportedError.error.innererror.internalException.message }
-            if ($null -eq $Message) { $Message = $($_.Exception.Message) }
-
-            $ExchangeTest = "Failed to connect to Exchange: $($ErrorMessage.NormalizedError)"
-            Write-LogMessage -headers $Headers -API $APINAME -tenant $tenant.defaultDomainName -message "Tenant access check for Exchange failed: $($ErrorMessage.NormalizedError) " -Sev 'Error' -LogData $ErrorMessage
-            Write-Warning "Failed to connect to Exchange: $($_.Exception.Message)"
+            Write-LogMessage -headers $Headers -API $APINAME -tenant $tenant.defaultDomainName -message "Exchange license capability check failed. Continuing with Exchange access validation. Error: $($ErrorMessage.NormalizedError)" -Sev 'Warning' -LogData $ErrorMessage
+            $ExchangeLicenseCapable = $true
         }
 
-        if ($GraphStatus -and $ExchangeStatus) {
+        if (-not $ExchangeLicenseCapable) {
+            $ExchangeSkippedByLicense = $true
+            $ExchangeStatus = $true
+            $ExchangeTest = 'Skipped Exchange access test: tenant does not have an Exchange license capability.'
+        } else {
+            try {
+                $null = New-ExoRequest -tenantid $Tenant.customerId -cmdlet 'Get-OrganizationConfig' -ErrorAction Stop
+
+                $OrgManagementRoles = New-ExoRequest -tenantid $Tenant.customerId -cmdlet 'Get-ManagementRoleAssignment' -cmdParams @{ Delegating = $false } | Where-Object { $_.RoleAssigneeName -eq 'Organization Management' } | Select-Object -Property Role, Guid
+                Write-Information "Found $($OrgManagementRoles.Count) Organization Management roles in Exchange"
+                $Results.OrgManagementRoles = $OrgManagementRoles
+
+                $RoleDefinitions = New-GraphGetRequest -tenantid $Tenant.customerId -uri 'https://graph.microsoft.com/beta/roleManagement/exchange/roleDefinitions'
+                Write-Information "Found $($RoleDefinitions.Count) Exchange role definitions"
+
+                $OrgRolePath = Join-Path $env:CIPPRootPath 'Config\OrganizationManagementRoles.json'
+                $AllOrgManagementRoles = Get-Content -Path $OrgRolePath -ErrorAction Stop | ConvertFrom-Json
+                Write-Information "Loaded all Organization Management roles from $OrgRolePath"
+
+                $AvailableRoles = $RoleDefinitions | Where-Object -Property displayName -In $AllOrgManagementRoles | Select-Object -Property displayName, id, description
+                Write-Information "Found $($AvailableRoles.Count) available Organization Management roles in Exchange"
+                $MissingOrgMgmtRoles = $AvailableRoles | Where-Object { $OrgManagementRoles.Role -notcontains $_.displayName }
+                if (($MissingOrgMgmtRoles | Measure-Object).Count -ge 5) {
+                    $Results.OrgManagementRolesMissing = $MissingOrgMgmtRoles
+                    Write-Warning "Found $($MissingRoles.Count) missing Organization Management roles in Exchange"
+                    $ExchangeStatus = $false
+                    $ExchangeTest = 'Connected to Exchange but missing permissions in Organization Management. This may impact the ability to manage Exchange features'
+                    Write-LogMessage -headers $Headers -API $APINAME -tenant $tenant.defaultDomainName -message 'Tenant access check for Exchange failed: Missing Organization Management roles' -sev 'Warning' -LogData $MissingOrgMgmtRoles
+                } else {
+                    Write-Warning 'All available Organization Management roles are present in Exchange'
+                    $ExchangeStatus = $true
+                    $ExchangeTest = 'Successfully connected to Exchange'
+                }
+            } catch {
+                $ErrorMessage = Get-CippException -Exception $_
+                $ReportedError = ($_.ErrorDetails | ConvertFrom-Json -ErrorAction SilentlyContinue)
+                $Message = if ($ReportedError.error.details.message) { $ReportedError.error.details.message } else { $ReportedError.error.innererror.internalException.message }
+                if ($null -eq $Message) { $Message = $($_.Exception.Message) }
+
+                $ExchangeTest = "Failed to connect to Exchange: $($ErrorMessage.NormalizedError)"
+                Write-LogMessage -headers $Headers -API $APINAME -tenant $tenant.defaultDomainName -message "Tenant access check for Exchange failed: $($ErrorMessage.NormalizedError) " -Sev 'Error' -LogData $ErrorMessage
+                Write-Warning "Failed to connect to Exchange: $($_.Exception.Message)"
+            }
+        }
+
+        if ($GraphStatus -and $ExchangeStatus -and (-not $ExchangeSkippedByLicense)) {
             Write-LogMessage -headers $Headers -API $APINAME -tenant $Tenant.defaultDomainName -tenantId $Tenant.customerId -message 'Tenant access check executed successfully' -Sev 'Info'
         }
 
@@ -150,7 +229,7 @@ function Test-CIPPAccessTenant {
         $Results.GraphTest = $GraphTest
         $Results.ExchangeStatus = $ExchangeStatus
         $Results.ExchangeTest = $ExchangeTest
-        $Results.GDAPRoles = @($GDAPRoles)
+        $Results.AssignedRoles = @($AssignedRoles)
         $Results.MissingRoles = @($MissingRoles)
 
         $Headers = $Headers.UserDetails

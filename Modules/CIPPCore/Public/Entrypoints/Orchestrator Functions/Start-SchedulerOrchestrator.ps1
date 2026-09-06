@@ -2,6 +2,9 @@ function Start-SchedulerOrchestrator {
     <#
     .SYNOPSIS
     Start the Scheduler Orchestrator
+
+    .FUNCTIONALITY
+    Entrypoint
     #>
     [CmdletBinding(SupportsShouldProcess = $true)]
     param()
@@ -9,7 +12,18 @@ function Start-SchedulerOrchestrator {
     $Table = Get-CIPPTable -TableName SchedulerConfig
     $Tenants = Get-CIPPAzDataTableEntity @Table | Where-Object -Property PartitionKey -NE 'WebhookAlert'
 
+    $ValidTypes = @('CIPPNotifications', 'webhookcreation')
+
     $Tasks = foreach ($Tenant in $Tenants) {
+        if ($Tenant.type -notin $ValidTypes) {
+            if ($Tenant.PartitionKey -eq 'Alert') {
+                Write-Information "Scheduler: removing legacy classic-alert row for '$($Tenant.tenant)'"
+                Remove-CIPPAzDataTableEntity -Force @Table -Entity $Tenant
+            } else {
+                Write-Information "Scheduler: skipping row $($Tenant.PartitionKey)/$($Tenant.RowKey) - no handler for type '$($Tenant.type)'"
+            }
+            continue
+        }
         if ($Tenant.tenant -ne 'AllTenants') {
             [pscustomobject]@{
                 Tenant   = $Tenant.tenant
@@ -58,6 +72,6 @@ function Start-SchedulerOrchestrator {
     }
 
     if ($PSCmdlet.ShouldProcess('Start-ScheduleOrchestrator', 'Starting Scheduler Orchestrator')) {
-        Start-NewOrchestration -FunctionName 'CIPPOrchestrator' -InputObject ($InputObject | ConvertTo-Json -Depth 5 -Compress)
+        Start-CIPPOrchestrator -InputObject $InputObject
     }
 }

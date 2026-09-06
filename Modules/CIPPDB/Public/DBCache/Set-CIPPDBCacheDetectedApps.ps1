@@ -1,0 +1,140 @@
+function Set-CIPPDBCacheDetectedApps {
+    <#
+    .SYNOPSIS
+        Caches detected apps using the AppInvRawData export submitted earlier,
+        enriched with the live /detectedApps catalog.
+
+    .PARAMETER TenantFilter
+        The tenant to cache detected apps for.
+
+    .PARAMETER QueueId
+        Optional queue ID for progress tracking.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$TenantFilter,
+        [string]$QueueId
+    )
+
+    $ReportName = 'AppInvRawData'
+
+    try {
+        $JobsTable = Get-CIPPTable -tablename 'IntuneReportJobs'
+        $JobRow = Get-CIPPAzDataTableEntity @JobsTable -Filter "PartitionKey eq '$TenantFilter' and RowKey eq '$ReportName'"
+
+        if (-not $JobRow) {
+            Write-LogMessage -API 'CIPPDBCache' -tenant $TenantFilter -message "No $ReportName export job pending - submitting a new one" -sev Info
+            $null = New-CIPPIntuneReportExportJob -TenantFilter $TenantFilter -ReportName $ReportName
+            $JobRow = Get-CIPPAzDataTableEntity @JobsTable -Filter "PartitionKey eq '$TenantFilter' and RowKey eq '$ReportName'"
+        }
+
+        $JobId = $JobRow.JobId
+        if (-not $JobId) {
+            Write-LogMessage -API 'CIPPDBCache' -tenant $TenantFilter -message "IntuneReportJobs row missing JobId - removing" -sev Warning
+            Remove-CIPPAzDataTableEntity @JobsTable -Entity $JobRow -Force -ErrorAction SilentlyContinue
+            return
+        }
+
+
+        $Deadline = [datetime]::UtcNow.AddMinutes(4)
+        while ($true) {
+            try {
+                $Job = New-GraphGetRequest -uri "https://graph.microsoft.com/beta/deviceManagement/reports/exportJobs/$JobId" -tenantid $TenantFilter
+            } catch {
+                $ErrorMessage = Get-CippException -Exception $_
+                Write-LogMessage -API 'CIPPDBCache' -tenant $TenantFilter -message "$ReportName job $JobId not retrievable: $($ErrorMessage.NormalizedError)" -sev Warning -LogData $ErrorMessage
+                Remove-CIPPAzDataTableEntity @JobsTable -Entity $JobRow -Force -ErrorAction SilentlyContinue
+                return
+            }
+
+            if ($Job.status -eq 'completed') { break }
+            if ($Job.status -eq 'failed') {
+                Write-LogMessage -API 'CIPPDBCache' -tenant $TenantFilter -message "$ReportName job $JobId failed" -sev Error
+                Remove-CIPPAzDataTableEntity @JobsTable -Entity $JobRow -Force -ErrorAction SilentlyContinue
+                return
+            }
+            if ([datetime]::UtcNow -ge $Deadline) {
+                # Keep the job row so the next cache run can consume the result
+                Write-LogMessage -API 'CIPPDBCache' -tenant $TenantFilter -message "$ReportName job $JobId still '$($Job.status)' after waiting - the result will be cached on the next run" -sev Info
+                return
+            }
+            Start-Sleep -Seconds 20
+        }
+
+        if (-not $Job.url) {
+            Write-LogMessage -API 'CIPPDBCache' -tenant $TenantFilter -message "$ReportName job $JobId completed but no url returned" -sev Error
+            Remove-CIPPAzDataTableEntity @JobsTable -Entity $JobRow -Force -ErrorAction SilentlyContinue
+            return
+        }
+
+        $ZipBytes = (Invoke-WebRequest -Uri $Job.url -UseBasicParsing -ErrorAction Stop).Content
+        if ($ZipBytes -isnot [byte[]]) { throw "Expected binary content from $ReportName download" }
+
+        $JsonText = $null
+        $ZipStream = [System.IO.MemoryStream]::new($ZipBytes, $false)
+        try {
+            $Archive = [System.IO.Compression.ZipArchive]::new($ZipStream, [System.IO.Compression.ZipArchiveMode]::Read)
+            try {
+                $Entry = $Archive.Entries | Where-Object { $_.Name -like '*.json' } | Select-Object -First 1
+                if (-not $Entry) { throw "No JSON entry in $ReportName archive" }
+                $EntryStream = $Entry.Open()
+                try {
+                    $Reader = [System.IO.StreamReader]::new($EntryStream)
+                    try { $JsonText = $Reader.ReadToEnd() } finally { $Reader.Dispose() }
+                } finally { $EntryStream.Dispose() }
+            } finally { $Archive.Dispose() }
+        } finally {
+            $ZipStream.Dispose()
+            $ZipBytes = $null
+        }
+
+        $ExportRows = @(($JsonText | ConvertFrom-Json).values)
+        $JsonText = $null
+
+        $AppsByKey = @{}
+        foreach ($Row in $ExportRows) {
+            $AppId = $Row.ApplicationKey
+            if (-not $AppId) { continue }
+            if (-not $AppsByKey.ContainsKey($AppId)) {
+                $AppsByKey[$AppId] = [pscustomobject]@{
+                    id             = $AppId
+                    displayName    = $Row.ApplicationName
+                    version        = $Row.ApplicationVersion
+                    publisher      = $Row.ApplicationPublisher
+                    platform       = $Row.Platform
+                    deviceCount    = 0
+                    managedDevices = [System.Collections.Generic.List[object]]::new()
+                }
+            }
+            $App = $AppsByKey[$AppId]
+            $App.managedDevices.Add([pscustomobject]@{
+                id                = $Row.DeviceId
+                deviceName        = $Row.DeviceName
+                osVersion         = $Row.OSVersion
+                platform          = $Row.Platform
+                userId            = $Row.UserId
+                userPrincipalName = $Row.UserName
+                emailAddress      = $Row.EmailAddress
+            })
+            $App.deviceCount++
+        }
+
+        # The grouped apps already hold every device row, so release the parse tree before the
+        # write rather than carrying both through it.
+        $ExportRows = $null
+
+        # Streamed into the writer instead of copied into an array first: Add-CIPPDbItem batches
+        # internally, so this drops a full-length copy of the app list at the point where the
+        # grouped devices are still live.
+        $DetectedAppCount = $AppsByKey.Count
+        $AppsByKey.Values | Add-CIPPDbItem -TenantFilter $TenantFilter -Type 'DetectedApps' -AddCount
+        $AppsByKey = $null
+        Write-LogMessage -API 'CIPPDBCache' -tenant $TenantFilter -message "Cached $DetectedAppCount detected apps with devices from export $JobId" -sev Info
+
+        Remove-CIPPAzDataTableEntity @JobsTable -Entity $JobRow -Force -ErrorAction SilentlyContinue
+    } catch {
+        $ErrorMessage = Get-CippException -Exception $_
+        Write-LogMessage -API 'CIPPDBCache' -tenant $TenantFilter -message "Failed to cache detected apps: $($ErrorMessage.NormalizedError)" -sev Error -LogData $ErrorMessage
+    }
+}

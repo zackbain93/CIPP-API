@@ -2,6 +2,9 @@ function Start-UpdatePermissionsOrchestrator {
     <#
     .SYNOPSIS
     Start the Update Permissions Orchestrator
+
+    .FUNCTIONALITY
+    Entrypoint
     #>
     [CmdletBinding(SupportsShouldProcess = $true)]
     param()
@@ -40,7 +43,13 @@ function Start-UpdatePermissionsOrchestrator {
 
         $Tenants = $Tenants | ForEach-Object {
             $CPVRow = $CPVRows | Where-Object -Property Tenant -EQ $_.customerId
-            if (!$CPVRow -or $env:ApplicationID -notin $CPVRow.applicationId -or $SAMPermissions.Timestamp -gt $CPVRow.Timestamp.DateTime -or $CPVRow.Timestamp.DateTime -le (Get-Date).AddDays(-7).ToUniversalTime() -or !$_.defaultDomainName -or ($SAMroles.Timestamp.DateTime -gt $CPVRow.Timestamp.DateTime -and ($SAMRoles.Tenants -contains $_.defaultDomainName -or $SAMRoles.Tenants.value -contains $_.defaultDomainName -or $SAMRoles.Tenants -contains 'AllTenants' -or $SAMRoles.Tenants.value -contains 'AllTenants'))) {
+
+            # Determine retry interval based on last status
+            # No status or Failed status: retry after 1 day, Success: retry after 7 days
+            $RetryDays = if (!$CPVRow.LastStatus -or $CPVRow.LastStatus -eq 'Failed') { -1 } else { -7 }
+            $NeedsRetry = $CPVRow.Timestamp.DateTime -le (Get-Date).AddDays($RetryDays).ToUniversalTime()
+
+            if (!$CPVRow -or $env:ApplicationID -notin $CPVRow.applicationId -or $SAMPermissions.Timestamp -gt $CPVRow.Timestamp.DateTime -or $NeedsRetry -or !$_.defaultDomainName -or ($SAMroles.Timestamp.DateTime -gt $CPVRow.Timestamp.DateTime -and ($SAMRoles.Tenants -contains $_.defaultDomainName -or $SAMRoles.Tenants.value -contains $_.defaultDomainName -or $SAMRoles.Tenants -contains 'AllTenants' -or $SAMRoles.Tenants.value -contains 'AllTenants'))) {
                 $_
             }
         }
@@ -54,9 +63,16 @@ function Start-UpdatePermissionsOrchestrator {
                 OrchestratorName = 'UpdatePermissionsOrchestrator'
                 Batch            = @($TenantBatch)
             }
-            Start-NewOrchestration -FunctionName 'CIPPOrchestrator' -InputObject ($InputObject | ConvertTo-Json -Depth 5 -Compress)
+            $InstanceId = Start-CIPPOrchestrator -InputObject $InputObject
+            Write-LogMessage -API 'CPVRefresh' -tenant 'Global' -message "Started CPV permissions refresh for $TenantCount tenant(s). QueueId=$($Queue.RowKey)" -Sev 'Info'
+            return $InstanceId
         } else {
             Write-Information 'No tenants require permissions update'
+            Write-LogMessage -API 'CPVRefresh' -tenant 'Global' -message 'CPV permissions refresh triggered; no tenants required an update' -Sev 'Info'
+            return $null
         }
-    } catch {}
+    } catch {
+        $ErrorMessage = Get-CippException -Exception $_
+        Write-LogMessage -API 'CPVRefresh' -tenant 'Global' -message "Failed to start CPV permissions refresh: $($ErrorMessage.NormalizedError)" -Sev 'Error' -LogData $ErrorMessage
+    }
 }

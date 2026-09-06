@@ -36,7 +36,7 @@ function Set-CIPPGDAPInviteGroups {
 
         if ($PSCmdlet.ShouldProcess($Relationship.id, "Remove invite entry for $($Relationship.customer.displayName)")) {
             Write-LogMessage -API $APINAME -message "Groups mapped for GDAP Relationship: $($Relationship.customer.displayName) - $($Relationship.customer.displayName)" -Sev Info
-            Remove-AzDataTableEntity -Force @Table -Entity $Invite
+            Remove-CIPPAzDataTableEntity -Force @Table -Entity $Invite
         }
         return $true
     } else {
@@ -58,7 +58,7 @@ function Set-CIPPGDAPInviteGroups {
                     SkipLog          = $true
                 }
                 #Write-Information ($InputObject | ConvertTo-Json)
-                $InstanceId = Start-NewOrchestration -FunctionName 'CIPPOrchestrator' -InputObject (ConvertTo-Json -InputObject $InputObject -Depth 5 -Compress)
+                $InstanceId = Start-CIPPOrchestrator -InputObject $InputObject
                 Write-Information "Started GDAP Invite orchestration with ID = '$InstanceId'"
                 return $InstanceId
             }

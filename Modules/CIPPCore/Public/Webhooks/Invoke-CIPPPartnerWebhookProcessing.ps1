@@ -6,10 +6,18 @@ function Invoke-CippPartnerWebhookProcessing {
 
     try {
         if ($Data.AuditUri) {
-            $AuditLog = New-GraphGetRequest -uri $Data.AuditUri -tenantid $env:TenantID -NoAuthCheck $true -scope 'https://api.partnercenter.microsoft.com/.default'
+            $ParsedAuditUri = $null
+            if ([System.Uri]::TryCreate([string]$Data.AuditUri, [System.UriKind]::Absolute, [ref]$ParsedAuditUri) -and
+                $ParsedAuditUri.Scheme -eq 'https' -and
+                $ParsedAuditUri.Host -eq 'api.partnercenter.microsoft.com') {
+                $AuditLog = New-GraphGetRequest -uri $ParsedAuditUri.AbsoluteUri -tenantid $env:TenantID -NoAuthCheck $true -scope 'https://api.partnercenter.microsoft.com/.default'
+            } else {
+                Write-LogMessage -API 'Webhooks' -message "Partner Center webhook rejected: AuditUri is not a Partner Center API URL ($($Data.AuditUri))" -Sev 'Alert'
+                return
+            }
         }
 
-        Switch ($Data.EventName) {
+        switch ($Data.EventName) {
             'test-created' {
                 Write-LogMessage -API 'Webhooks' -message 'Partner Center webhook test received' -Sev 'Info'
             }
@@ -62,16 +70,23 @@ function Invoke-CippPartnerWebhookProcessing {
                         # Check for partner webhook onboarding settings
                         $ConfigTable = Get-CIPPTable -TableName Config
                         $WebhookConfig = Get-CIPPAzDataTableEntity @ConfigTable -Filter "RowKey eq 'PartnerWebhookOnboarding'"
-                        if ($WebhookConfig.StandardsExcludeAllTenants -eq $true) {
-                            $OnboardItem.StandardsExcludeAllTenants = $true
+
+                        # Only proceed if automated onboarding is enabled
+                        if ($WebhookConfig.Enabled -eq $true) {
+                            if ($WebhookConfig.StandardsExcludeAllTenants -eq $true) {
+                                $OnboardItem.StandardsExcludeAllTenants = $true
+                            }
+
+                            # Add onboarding entry to the table
+                            $OnboardTable = Get-CIPPTable -TableName 'TenantOnboarding'
+                            Add-CIPPAzDataTableEntity @OnboardTable -Entity $TenantOnboarding -Force -ErrorAction Stop
+
+                            # Start onboarding
+                            Push-ExecOnboardTenantQueue -Item $OnboardItem
+                            Write-LogMessage -API 'Webhooks' -message "Automated onboarding started for relationship $Id" -Sev 'Info'
+                        } else {
+                            Write-LogMessage -API 'Webhooks' -message "Automated onboarding is disabled. GDAP relationship $Id approved but not onboarded automatically." -Sev 'Info'
                         }
-
-                        # Add onboarding entry to the table
-                        $OnboardTable = Get-CIPPTable -TableName 'TenantOnboarding'
-                        Add-CIPPAzDataTableEntity @OnboardTable -Entity $TenantOnboarding -Force -ErrorAction Stop
-
-                        # Start onboarding
-                        Push-ExecOnboardTenantQueue -Item $OnboardItem
                     } else {
                         if ($AuditLog) {
                             Write-LogMessage -API 'Webhooks' -message "Partner Center $($Data.EventName) audit log webhook received" -LogData $AuditObj -Sev 'Alert'

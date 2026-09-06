@@ -1,0 +1,51 @@
+function Invoke-ExecRunTenantGroupRule {
+    <#
+    .SYNOPSIS
+        Execute tenant group dynamic rules immediately
+    .DESCRIPTION
+        This function executes dynamic tenant group rules for immediate membership updates
+    .FUNCTIONALITY
+        Entrypoint,AnyTenant
+    .ROLE
+        Tenant.Groups.ReadWrite
+    #>
+    [CmdletBinding()]
+    param($Request, $TriggerMetadata)
+
+    $GroupId = $Request.Body.groupId ?? $Request.Query.groupId
+
+    # Same gate as Invoke-ExecTenantGroup: group management requires unrestricted group scope
+    $AllowedGroups = Test-CippAccess -Request $Request -GroupList
+    if ($AllowedGroups -notcontains 'AllGroups') {
+        return ([HttpResponseContext]@{
+                StatusCode = [HttpStatusCode]::Forbidden
+                Body       = @{ Results = 'You do not have permission to manage tenant groups.' }
+            })
+    }
+
+    try {
+        $GroupTable = Get-CippTable -tablename 'TenantGroups'
+        $Group = Get-CIPPAzDataTableEntity @GroupTable -Filter "PartitionKey eq 'TenantGroup' and RowKey eq '$GroupId'"
+
+        if (-not $Group) { $Body = @{ Results = 'Group not found' } }
+
+        $null = Start-TenantDynamicGroupOrchestrator -GroupId $GroupId
+
+        $Result = "Dynamic rules executed successfully for group '$($Group.Name)'. Processing will continue in the background. Check the logbook for details."
+        Write-LogMessage -API 'TenantGroups' -tenant 'Global' -headers $Request.Headers -message $Result -Sev 'Info'
+        $Body = @{ Results = $Result }
+
+        return ([HttpResponseContext]@{
+                StatusCode = [HttpStatusCode]::OK
+                Body       = $Body
+            })
+    } catch {
+        $ErrorMessage = Get-NormalizedError -Message $_.Exception.Message
+        Write-LogMessage -API 'TenantGroups' -tenant 'Global' -message "Failed to execute tenant group rules: $ErrorMessage" -sev Error
+        $Body = @{ Results = "Failed to execute dynamic rules: $ErrorMessage" }
+        return ([HttpResponseContext]@{
+                StatusCode = [HttpStatusCode]::InternalServerError
+                Body       = $Body
+            })
+    }
+}

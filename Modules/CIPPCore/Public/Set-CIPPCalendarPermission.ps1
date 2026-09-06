@@ -6,15 +6,16 @@ function Set-CIPPCalendarPermission {
         $RemoveAccess,
         $TenantFilter,
         $UserID,
-        $folderName,
+        $FolderName,
         $UserToGetPermissions,
         $LoggingName,
         $Permissions,
-        [bool]$CanViewPrivateItems
+        [bool]$CanViewPrivateItems,
+        [bool]$SendNotificationToUser = $false,
+        [switch]$AutoResolveFolderName
     )
 
     try {
-
         # If a pretty logging name is not provided, use the ID instead
         if ([string]::IsNullOrWhiteSpace($LoggingName) -and $RemoveAccess) {
             $LoggingName = $RemoveAccess
@@ -22,34 +23,64 @@ function Set-CIPPCalendarPermission {
             $LoggingName = $UserToGetPermissions
         }
 
+        # When -AutoResolveFolderName is set, look up the locale-independent FolderId.
+        # FolderType -eq 'Calendar' is an internal Exchange enum, always English regardless of mailbox language.
+        # Callers that already supply the correct localized FolderName should NOT pass this switch.
+        if ($AutoResolveFolderName) {
+            $CalFolderStats = New-ExoRequest -tenantid $TenantFilter -cmdlet 'Get-MailboxFolderStatistics' -cmdParams @{
+                Identity    = $UserID
+                FolderScope = 'Calendar'
+            } -Anchor $UserID | Where-Object { $_.FolderType -eq 'Calendar' }
+            $FolderIdentity = if ($CalFolderStats) { "$($UserID):$($CalFolderStats.FolderId)" } else { "$($UserID):\$FolderName" }
+        } else {
+            $FolderIdentity = "$($UserID):\$FolderName"
+        }
+
         $CalParam = [PSCustomObject]@{
-            Identity     = "$($UserID):\$folderName"
-            AccessRights = @($Permissions)
-            User         = $UserToGetPermissions
+            Identity               = $FolderIdentity
+            AccessRights           = @($Permissions)
+            User                   = $UserToGetPermissions
+            SendNotificationToUser = $SendNotificationToUser
         }
 
         if ($CanViewPrivateItems) {
             $CalParam | Add-Member -NotePropertyName 'SharingPermissionFlags' -NotePropertyValue 'Delegate,CanViewPrivateItems'
         }
-        
+
         if ($RemoveAccess) {
-            if ($PSCmdlet.ShouldProcess("$UserID\$folderName", "Remove permissions for $LoggingName")) {
-                $null = New-ExoRequest -tenantid $TenantFilter -cmdlet 'Remove-MailboxFolderPermission' -cmdParams @{Identity = "$($UserID):\$folderName"; User = $RemoveAccess }
+            if ($PSCmdlet.ShouldProcess("$UserID\$FolderName", "Remove permissions for $LoggingName")) {
+                $null = Remove-CIPPFolderPermission -TenantFilter $TenantFilter -FolderIdentity $FolderIdentity -User $RemoveAccess -AccessRights ($Permissions -join ', ') -Anchor $UserID
                 $Result = "Successfully removed access for $LoggingName from calendar $($CalParam.Identity)"
                 Write-LogMessage -headers $Headers -API $APIName -tenant $TenantFilter -message $Result -sev Info
+
+                # Sync cache
+                Sync-CIPPCalendarPermissionCache -TenantFilter $TenantFilter -MailboxIdentity $UserID -FolderName $FolderName -User $RemoveAccess -Action 'Remove'
             }
         } else {
-            if ($PSCmdlet.ShouldProcess("$UserID\$folderName", "Set permissions for $LoggingName to $Permissions")) {
+            if ($PSCmdlet.ShouldProcess("$UserID\$FolderName", "Set permissions for $LoggingName to $Permissions")) {
                 try {
                     $null = New-ExoRequest -tenantid $TenantFilter -cmdlet 'Set-MailboxFolderPermission' -cmdParams $CalParam -Anchor $UserID
                 } catch {
-                    $null = New-ExoRequest -tenantid $TenantFilter -cmdlet 'Add-MailboxFolderPermission' -cmdParams $CalParam -Anchor $UserID
+                    # Set fails when there is no entry to update, so Add is the expected fallback.
+                    # Keep Set's error too, or an unrelated Add failure hides why Set failed.
+                    $SetError = $_
+                    try {
+                        $null = New-ExoRequest -tenantid $TenantFilter -cmdlet 'Add-MailboxFolderPermission' -cmdParams $CalParam -Anchor $UserID
+                    } catch {
+                        throw "Set-MailboxFolderPermission failed ($($SetError.Exception.Message)) and Add-MailboxFolderPermission also failed: $($_.Exception.Message)"
+                    }
                 }
-                Write-LogMessage -headers $Headers -API $APIName -tenant $TenantFilter -message "Successfully set Calendar permissions $Permissions for $LoggingName on $UserID." -sev Info
                 $Result = "Successfully set permissions on folder $($CalParam.Identity). The user $LoggingName now has $Permissions permissions on this folder."
                 if ($CanViewPrivateItems) {
-                    $Result += " The user can also view private items."
+                    $Result += ' The user can also view private items.'
                 }
+                if ($SendNotificationToUser) {
+                    $Result += ' A notification has been sent to the user.'
+                }
+                Write-LogMessage -headers $Headers -API $APIName -tenant $TenantFilter -message $Result -sev Info
+
+                # Sync cache
+                Sync-CIPPCalendarPermissionCache -TenantFilter $TenantFilter -MailboxIdentity $UserID -FolderName $FolderName -User $UserToGetPermissions -Permissions $Permissions -Action 'Add'
             }
         }
     } catch {

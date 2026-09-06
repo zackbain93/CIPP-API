@@ -1,0 +1,66 @@
+Function Invoke-ExecBECCheck {
+    <#
+    .FUNCTIONALITY
+        Entrypoint
+    .ROLE
+        Identity.User.Read
+    .DESCRIPTION
+        Returns the business email compromise assessment for a user: sign-ins with a location analysis against the user's assigned usage location, mailbox rules and rule changes, trusted/blocked sender changes, OneDrive and SharePoint sharing link activity, added applications matched against the known-malicious catalog, MFA methods, Intune devices, sent mail, and tenant-wide password changes. If no cached result exists the check is queued as a background job and the response reports it as waiting, so poll rather than expecting results on the first call. Pass overwrite=true to force a fresh run.
+    #>
+    [CmdletBinding()]
+    param($Request, $TriggerMetadata)
+
+    $Table = Get-CippTable -tablename 'cachebec'
+
+    $UserId = $Request.Query.userid ?? $Request.Query.GUID
+    $Filter = "PartitionKey eq 'bec' and RowKey eq '$UserId'"
+    $JSONOutput = Get-CIPPAzDataTableEntity @Table -Filter $Filter
+    Write-Host ($Request.Query | ConvertTo-Json)
+
+    $body = if (([string]::IsNullOrEmpty($JSONOutput.Results) -and $JSONOutput.Status -ne 'Waiting' ) -or $Request.Query.overwrite -eq $true) {
+        $Batch = @{
+            'FunctionName' = 'BECRun'
+            'UserID'       = $Request.Query.userid
+            'TenantFilter' = $Request.Query.tenantFilter
+            'userName'     = $Request.Query.userName
+        }
+
+        $Table = Get-CippTable -tablename 'cachebec'
+
+        $Entity = @{
+            UserId       = $Request.Query.userid
+            Results      = ''
+            RowKey       = $Request.Query.userid
+            Status       = 'Waiting'
+            PartitionKey = 'bec'
+        }
+        Add-CIPPAzDataTableEntity @Table -Entity $Entity -Force
+
+        $InputObject = [PSCustomObject]@{
+            OrchestratorName = 'BECRunOrchestrator'
+            Batch            = @($Batch)
+            SkipLog          = $true
+        }
+        #Write-Host ($InputObject | ConvertTo-Json)
+        $null = Start-CIPPOrchestrator -InputObject $InputObject
+
+        @{ GUID = $Request.Query.userid }
+    } else {
+        if (!$Request.Query.GUID) {
+            @{ GUID = $Request.Query.userid }
+        } else {
+            if (!$JSONOutput -or $JSONOutput.Status -eq 'Waiting') {
+                @{ Waiting = $true }
+            } else {
+                $JSONOutput.Results
+            }
+        }
+    }
+
+
+    return ([HttpResponseContext]@{
+            StatusCode = [HttpStatusCode]::OK
+            Body       = $body
+        })
+
+}

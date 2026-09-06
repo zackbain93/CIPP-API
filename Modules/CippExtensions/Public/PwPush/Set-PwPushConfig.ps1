@@ -8,10 +8,14 @@ function Set-PwPushConfig {
 
     .PARAMETER Configuration
     Configuration object
+
+    .PARAMETER FullConfiguration
+    Full parsed configuration object including CFZTNA settings
     #>
     [CmdletBinding(SupportsShouldProcess = $true)]
     param(
-        $Configuration
+        $Configuration,
+        $FullConfiguration
     )
     $InitParams = @{}
     if ($Configuration.BaseUrl) {
@@ -32,8 +36,28 @@ function Set-PwPushConfig {
     $Module = Get-Module PassPushPosh -ListAvailable
     Write-Information "PWPush Version: $($Module.Version)"
     if ($PSCmdlet.ShouldProcess('Initialize-PassPushPosh')) {
-        Write-Information ($InitParams | ConvertTo-Json)
-        Initialize-PassPushPosh @InitParams
+        $LogParams = @{} + $InitParams
+        foreach ($Secret in 'APIKey', 'Bearer') {
+            if ($LogParams.ContainsKey($Secret)) { $LogParams[$Secret] = 'REDACTED' }
+        }
+        Write-Information ($LogParams | ConvertTo-Json)
+        # -Force: workers are long-lived and shared, and without it Initialize-PassPushPosh is a
+        # no-op after a worker's first call - the worker then keeps the auth headers and base URL
+        # from whatever configuration it saw first, so config changes and key rotations never land.
+        Initialize-PassPushPosh @InitParams -Force
+    }
+
+    if ($Configuration.CFEnabled -eq $true -and $FullConfiguration.CFZTNA.Enabled -eq $true) {
+        $CFAPIKey = Get-ExtensionAPIKey -Extension 'CFZTNA'
+        $PPPModule = Get-Module PassPushPosh
+        & $PPPModule {
+            if (-not $Script:PPPHeaders) {
+                $Script:PPPHeaders = @{}
+            }
+            $Script:PPPHeaders['CF-Access-Client-Id'] = $args[0]
+            $Script:PPPHeaders['CF-Access-Client-Secret'] = $args[1]
+        } $FullConfiguration.CFZTNA.ClientId "$CFAPIKey"
+        Write-Information 'CF-Access-Client-Id and CF-Access-Client-Secret headers added to PWPush API request'
     }
 }
 

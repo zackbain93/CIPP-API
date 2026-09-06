@@ -6,9 +6,10 @@ function Get-CIPPSchemaExtensions {
     )
 
     # Get definitions file
-    $CIPPCore = Get-Module -Name 'CIPPCore' | Select-Object -ExpandProperty ModuleBase
-    $CIPPRoot = (Get-Item -Path $CIPPCore).Parent.Parent
-    $SchemaDefinitionsPath = Join-Path $CIPPRoot 'Config\schemaDefinitions.json'
+    $SchemaDefinitionsPath = Join-Path $env:CIPPRootPath 'Config\schemaDefinitions.json'
+
+    # Graph only allows the status to move forward through this lifecycle
+    $StatusOrder = @{ InDevelopment = 0; Available = 1; Deprecated = 2 }
 
     # check CustomData table for schema extensions
     $CustomDataTable = Get-CippTable -tablename 'CustomData'
@@ -49,7 +50,7 @@ function Get-CIPPSchemaExtensions {
                 if (Compare-Object -ReferenceObject ($SchemaDefinition.properties | Sort-Object name | Select-Object name, type) -DifferenceObject ($Schema.properties | Sort-Object name | Select-Object name, type)) {
                     $Patch.properties = $SchemaDefinition.properties
                 }
-                if ($Schema.status -ne $SchemaDefinition.status) {
+                if ($StatusOrder[$SchemaDefinition.status] -gt $StatusOrder[$Schema.status]) {
                     $Patch.status = $SchemaDefinition.status
                 }
                 if ($Schema.targetTypes -ne $SchemaDefinition.targetTypes) {
@@ -64,7 +65,7 @@ function Get-CIPPSchemaExtensions {
                     Write-LogMessage -headers $Headers -message "Updated Schema Extension: $($SchemaDefinition.id)" -API 'Get-CIPPSchemaExtensions' -Sev 'info' -LogData $Body
                 }
                 if ($Patch.status -eq 'Deprecated') {
-                    Remove-AzDataTableEntity @CustomDataTable -Entity $SchemaExtension -Force
+                    Remove-CIPPAzDataTableEntity @CustomDataTable -Entity $SchemaExtension -Force
                 } else {
                     $NewSchema = [string]($Schema | ConvertTo-Json -Depth 5 -Compress)
                     if ($SchemaExtension.JSON -ne $NewSchema) {
@@ -86,6 +87,7 @@ function Get-CIPPSchemaExtensions {
                 }
                 $PatchJson = ConvertTo-Json -Depth 5 -InputObject $Patch
                 $null = New-GraphPOSTRequest -type PATCH -Uri "https://graph.microsoft.com/v1.0/schemaExtensions/$($Schema.id)" -Body $PatchJson -AsApp $true -NoAuthCheck $true
+                $Schema = New-GraphGETRequest -uri "https://graph.microsoft.com/v1.0/schemaExtensions/$($Schema.id)" -AsApp $true -NoAuthCheck $true
             }
             try {
                 $OldSchema = $SchemaExtensions | Where-Object { $Schema.id -match $_.RowKey }

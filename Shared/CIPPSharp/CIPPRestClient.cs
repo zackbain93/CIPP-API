@@ -1,0 +1,1354 @@
+#nullable enable
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.IO;
+using System.IO.Compression;
+using System.Linq;
+using System.Net;
+using System.Net.Http;
+using System.Text;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+
+namespace CIPP
+{
+    // =====================================================================
+    // HttpResult
+    // =====================================================================
+    // Sealed result type returned to the PowerShell wrapper for every HTTP
+    // call. Using init-only properties keeps this effectively immutable once
+    // constructed by SendAsync — no caller can mutate the result after the
+    // fact, which is important when results flow across runspace boundaries.
+    // =====================================================================
+    public sealed class HttpResult
+    {
+        public int                          StatusCode      { get; init; }
+        public bool                         IsSuccess       { get; init; }
+        public string                       Content         { get; init; } = string.Empty;
+        public bool                         IsJson          { get; init; }
+
+        /// <summary>
+        /// Flat header dictionary keyed by header name (case-insensitive).
+        /// Multi-value headers are preserved as string arrays, matching the
+        /// shape that Invoke-RestMethod surfaces via -ResponseHeadersVariable.
+        /// </summary>
+        public Dictionary<string, string[]> ResponseHeaders { get; init; } = new();
+    }
+
+    // =====================================================================
+    // CIPPConcurrentRequest / CIPPConcurrentResult
+    // =====================================================================
+    // One PowerShell call, many async HTTP requests. PowerShell builds the
+    // request list (and acquires any auth token once, passing it in Headers),
+    // then calls CIPPRestClient.SendConcurrent — the .NET side fans the requests
+    // out concurrently, bounded by a semaphore, with Retry-After / backoff on
+    // 429 and 5xx. This keeps concurrency in .NET (robust async) rather than
+    // ForEach-Object -Parallel runspaces in the PowerShell worker. Per-hostname
+    // connection caps (see the pool design above) still apply, so a burst to one
+    // host cannot exceed that host's connection budget.
+    // =====================================================================
+    public sealed class CIPPConcurrentRequest
+    {
+        public string                      Uri                { get; set; } = string.Empty;
+        public string                      Method             { get; set; } = "GET";
+        public string?                     Body               { get; set; }
+        public Dictionary<string, string>? Headers            { get; set; }
+        public string?                     ContentType        { get; set; }
+        public int                         TimeoutSec         { get; set; } = 100;
+        public int                         MaximumRedirection { get; set; } = -1;
+    }
+
+    /// <summary>
+    /// Per-request outcome, returned in the same order as the input requests.
+    /// A failed request never aborts the batch: transport failures land in
+    /// <see cref="Error"/>, HTTP responses (including 4xx/5xx after retries) land
+    /// in <see cref="Result"/>. Index maps back to the caller's request array.
+    /// </summary>
+    public sealed class CIPPConcurrentResult
+    {
+        public int         Index      { get; init; }
+        public bool        IsSuccess  { get; init; }
+        public int         StatusCode { get; init; }
+        public HttpResult? Result     { get; init; }
+        public string?     Error      { get; init; }
+        public int         Attempts   { get; init; }
+    }
+
+    // =====================================================================
+    // CIPPResponseHeaders / CIPPHttpResponse / CIPPHttpRequestException
+    // =====================================================================
+    // When a request returns a non-success status, the PowerShell wrapper
+    // (Invoke-CIPPRestMethod) throws a CIPPHttpRequestException. CIPP's Graph
+    // helpers were written against Invoke-RestMethod's HttpResponseException
+    // and read:
+    //     $_.Exception.Response.StatusCode -eq 429
+    //     $_.Exception.Response.Headers['Retry-After']
+    // The pooled client previously threw a bare HttpRequestException with no
+    // .Response, so those branches were dead. These types restore the expected
+    // shape: a .Response with a StatusCode (HttpStatusCode, so `-eq 429` works)
+    // and Headers that support case-insensitive string indexing returning a
+    // scalar value (so ['Retry-After'] works), matching the old behaviour.
+    // =====================================================================
+
+    /// <summary>
+    /// Case-insensitive response-header view exposed to PowerShell. The string
+    /// indexer returns the (comma-joined) value for a header, or null if absent,
+    /// mirroring how WebHeaderCollection / HttpResponseHeaders were consumed in
+    /// CIPP via $response.Headers['Header-Name'].
+    /// </summary>
+    public sealed class CIPPResponseHeaders
+    {
+        private readonly Dictionary<string, string[]> _headers;
+
+        public CIPPResponseHeaders(Dictionary<string, string[]>? headers)
+        {
+            _headers = headers is not null
+                ? new Dictionary<string, string[]>(headers, StringComparer.OrdinalIgnoreCase)
+                : new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase);
+        }
+
+        /// <summary>$resp.Headers['Retry-After'] -> scalar string (joined), or null.</summary>
+        public string? this[string key]
+            => key is not null && _headers.TryGetValue(key, out var v) ? string.Join(", ", v) : null;
+
+        public bool Contains(string key) => key is not null && _headers.ContainsKey(key);
+        public string[]? GetValues(string key) => key is not null && _headers.TryGetValue(key, out var v) ? v : null;
+        public IEnumerable<string> Keys => _headers.Keys;
+        public int Count => _headers.Count;
+    }
+
+    /// <summary>
+    /// Lightweight stand-in for the response object CIPP code reaches through
+    /// $_.Exception.Response. Carries the status code (as HttpStatusCode so
+    /// `-eq 429` works), the headers (string-indexable), and the raw body.
+    /// </summary>
+    public sealed class CIPPHttpResponse
+    {
+        public HttpStatusCode StatusCode { get; }
+        public int StatusCodeValue { get; }
+        public CIPPResponseHeaders Headers { get; }
+        public string Content { get; }
+
+        public CIPPHttpResponse(int statusCode, Dictionary<string, string[]>? headers, string? content)
+        {
+            StatusCode      = (HttpStatusCode)statusCode;
+            StatusCodeValue = statusCode;
+            Headers         = new CIPPResponseHeaders(headers);
+            Content         = content ?? string.Empty;
+        }
+    }
+
+    /// <summary>
+    /// HttpRequestException subclass carrying a .Response (CIPPHttpResponse).
+    /// Subclassing keeps existing `catch [System.Net.Http.HttpRequestException]`
+    /// and `$_.Exception.Message` / `$_.ErrorDetails.Message` handling intact,
+    /// while restoring `$_.Exception.Response.StatusCode` /
+    /// `$_.Exception.Response.Headers['Retry-After']`.
+    /// </summary>
+    public sealed class CIPPHttpRequestException : HttpRequestException
+    {
+        public CIPPHttpResponse Response { get; }
+
+        public CIPPHttpRequestException(string message, int statusCode, Dictionary<string, string[]>? headers, string? content)
+            : base(message, null, (HttpStatusCode)statusCode)
+        {
+            Response = new CIPPHttpResponse(statusCode, headers, content);
+        }
+    }
+
+    // =====================================================================
+    // CIPPRestClient
+    // =====================================================================
+    // Thread-safe, process-scoped HTTP client manager.
+    //
+    // DESIGN GOALS
+    // ------------
+    // 1. Eliminate SNAT port exhaustion caused by Invoke-RestMethod creating
+    //    a new HttpClient (and therefore new TCP connections) on every call.
+    // 2. Enforce per-hostname connection caps to stay within the Azure
+    //    Function App SNAT port budget of 125 ports per instance.
+    // 3. Tune connection pool parameters independently per destination so
+    //    high-volume endpoints (Graph) don't starve low-volume ones (Login).
+    //
+    // PORT BUDGET (125 total, targeting ~75 allocated, ~50 buffer)
+    // -------------------------------------------------------------
+    //   Graph          30   microsoft.com graph endpoints
+    //   EXO            20   Exchange Online / Outlook endpoints
+    //   Login           5   login.microsoftonline.com (token acquisition)
+    //   AdminPlane      5   admin.microsoft.com, reports, Defender, etc.
+    //   Compliance      5   compliance redirect discovery (no-redirect)
+    //   PartnerCenter   5   api.partnercenter.microsoft.com
+    //   SPO             5   *.sharepoint.com CSOM/_api (concurrent per-site fan-out)
+    //   DNS             2   dns.google.com, cloudflare-dns.com (per host)
+    //   Default         5   catch-all + absorbs legacy Invoke-RestMethod calls
+    //   ─────────────
+    //   Total          84   leaves a 41-port buffer for the Functions host,
+    //                       Durable extension, AppInsights, Azure SDK clients,
+    //                       and any stragglers that bypass the pool.
+    //
+    // CONCURRENCY ASSUMPTIONS
+    // -----------------------
+    // PSWorkerInProcConcurrencyUpperBound = 10  (set as an App Setting; this
+    //   is the target steady-state value — the caps above are sized for this.)
+    // FUNCTIONS_WORKER_PROCESS_COUNT      = 1
+    // Traffic split: ~2/3 Graph, ~1/3 EXO
+    //
+    // At peak (10 concurrent invocations):
+    //   ~7 Graph calls in flight   → 30-cap absorbs pagination bursts
+    //                                 and fan-out activity workers
+    //   ~3 EXO calls in flight     → 20-cap absorbs bulk EXO batches
+    //   Login bursts on cold start → 5-cap, backed by aggressive token
+    //                                 caching so steady-state is 1-2 conns
+    //
+    // Graph and EXO caps are larger than the concurrency bound because a
+    // single runspace can legitimately have multiple requests in flight
+    // (pagination, $batch sub-requests, token + data pre-fetch, parallel
+    // retries). The smaller pools (Login/AdminPlane/Compliance/PartnerCenter/
+    // Default) are low-volume and can safely queue briefly if saturated.
+    //
+    // HTTP/2 NOTE
+    // -----------
+    // Graph and EXO both support HTTP/2. With EnableMultipleHttp2Connections,
+    // the handler opens additional H2 connections when the existing ones are
+    // saturated, but multiple streams share each TCP connection. In practice
+    // real port consumption will be significantly below the configured caps
+    // for these endpoints.
+    //
+    // SINGLETON INITIALISATION
+    // ------------------------
+    // All singleton HttpClient instances are lazily initialised on first use via
+    // a SemaphoreSlim-guarded double-checked lock. Once created they live for
+    // the lifetime of the worker process — this is intentional. Disposing and
+    // recreating clients would defeat connection pooling entirely.
+    // =====================================================================
+    public static class CIPPRestClient
+    {
+        // -----------------------------------------------------------------
+        // Singleton HttpClient instances — one per destination group.
+        // Each is backed by its own SocketsHttpHandler so connection pool
+        // limits are enforced independently per group.
+        // -----------------------------------------------------------------
+        private static HttpClient? _graphClient;
+        private static HttpClient? _exoClient;
+        private static HttpClient? _loginClient;
+        private static HttpClient? _complianceClient;
+        private static HttpClient? _partnerCenterClient;
+        private static HttpClient? _adminPlaneClient;
+        private static HttpClient? _spoClient;
+        private static HttpClient? _dnsClient;
+        private static HttpClient? _defaultClient;
+
+        /// <summary>
+        /// Guards lazy initialisation. Max count of 1 makes this a binary
+        /// semaphore (mutex equivalent) without the thread-affinity of Monitor.
+        /// </summary>
+        private static readonly SemaphoreSlim _initLock = new(1, 1);
+
+        // -----------------------------------------------------------------
+        // Lightweight usage telemetry for diagnostics.
+        // -----------------------------------------------------------------
+        private static readonly ConcurrentDictionary<string, long> _poolSelections =
+            new(StringComparer.OrdinalIgnoreCase);
+        private static readonly ConcurrentDictionary<string, long> _poolSuccesses =
+            new(StringComparer.OrdinalIgnoreCase);
+        private static readonly ConcurrentDictionary<string, long> _poolFailures =
+            new(StringComparer.OrdinalIgnoreCase);
+        private static readonly ConcurrentDictionary<string, long> _poolTransportErrors =
+            new(StringComparer.OrdinalIgnoreCase);
+        private static readonly ConcurrentDictionary<string, long> _hostSelections =
+            new(StringComparer.OrdinalIgnoreCase);
+        private static readonly ConcurrentDictionary<int, long> _statusCodes = new();
+
+        // -----------------------------------------------------------------
+        // Client factory helpers
+        // -----------------------------------------------------------------
+        // Each method builds a SocketsHttpHandler tuned for its destination:
+        //
+        //   PooledConnectionLifetime  30 min  — upper bound recommended by the
+        //     Azure App Service / SocketsHttpHandler guidance. Connections are
+        //     recycled after this age to respect DNS TTL changes (e.g. Azure
+        //     Traffic Manager failovers). Raising from 15 min halves the
+        //     graceful-recycle churn and cuts the TIME_WAIT tail under steady
+        //     load — a small but measurable port saving.
+        //
+        //   PooledConnectionIdleTimeout  2 min — idle connections that have
+        //     not been used for 2 minutes are closed and removed from the
+        //     pool. Keeps the pool lean during quiet periods.
+        //
+        //   MaxConnectionsPerServer — hard cap on simultaneous TCP connections
+        //     to a single host:port pair. Requests beyond this limit queue
+        //     inside the handler rather than opening a new connection, which
+        //     is exactly the SNAT-friendly behaviour we want.
+        //
+        //   HttpClient.Timeout = InfiniteTimeSpan — per-request timeouts are
+        //     applied via CancellationToken in SendAsync instead. A shared
+        //     HttpClient timeout would race against every in-flight request
+        //     and is not safe to use with a singleton client.
+        // -----------------------------------------------------------------
+
+        /// <summary>
+        /// Graph client — highest throughput, HTTP/2 enabled.
+        /// Covers graph.microsoft.com and any *.microsoft.com graph surface.
+        /// Cap: 30 connections.
+        /// </summary>
+        private static HttpClient BuildGraphClient() => new HttpClient(new SocketsHttpHandler
+        {
+            AutomaticDecompression         = DecompressionMethods.All,
+            PooledConnectionLifetime       = TimeSpan.FromMinutes(30),
+            PooledConnectionIdleTimeout    = TimeSpan.FromMinutes(2),
+            EnableMultipleHttp2Connections = true,   // Graph supports HTTP/2; streams share connections
+            AllowAutoRedirect              = true,
+            MaxAutomaticRedirections       = 10,
+            MaxConnectionsPerServer        = 30,
+        }) { Timeout = Timeout.InfiniteTimeSpan };
+
+        /// <summary>
+        /// EXO client — Exchange Online and Outlook endpoints.
+        /// Covers outlook.office365.com, outlook.office.com, outlook.com,
+        /// and *.protection.outlook.com (mail protection / transport).
+        /// Cap: 20 connections.
+        /// HTTP/2 enabled — EXO REST APIs support it.
+        /// </summary>
+        private static HttpClient BuildExoClient() => new HttpClient(new SocketsHttpHandler
+        {
+            AutomaticDecompression         = DecompressionMethods.All,
+            PooledConnectionLifetime       = TimeSpan.FromMinutes(30),
+            PooledConnectionIdleTimeout    = TimeSpan.FromMinutes(2),
+            EnableMultipleHttp2Connections = true,
+            AllowAutoRedirect              = true,
+            MaxAutomaticRedirections       = 10,
+            MaxConnectionsPerServer        = 20,
+        }) { Timeout = Timeout.InfiniteTimeSpan };
+
+        /// <summary>
+        /// Login client — token acquisition against login.microsoftonline.com.
+        /// Cap: 5 connections. HTTP/2 disabled — login.microsoftonline.com
+        /// does not benefit from H2 multiplexing for short-lived token
+        /// requests, and tokens are cached aggressively so the steady-state
+        /// rate of requests is low.
+        /// </summary>
+        private static HttpClient BuildLoginClient() => new HttpClient(new SocketsHttpHandler
+        {
+            AutomaticDecompression         = DecompressionMethods.All,
+            PooledConnectionLifetime       = TimeSpan.FromMinutes(30),
+            PooledConnectionIdleTimeout    = TimeSpan.FromMinutes(2),
+            EnableMultipleHttp2Connections = false,
+            AllowAutoRedirect              = true,
+            MaxAutomaticRedirections       = 5,
+            MaxConnectionsPerServer        = 5,
+        }) { Timeout = Timeout.InfiniteTimeSpan };
+
+        /// <summary>
+        /// Compliance client — used exclusively for EXO compliance URL
+        /// discovery (New-ExoRequest with MaximumRedirection = 0).
+        /// AllowAutoRedirect is false because the 3xx redirect response IS
+        /// the expected result — the Location header contains the real EXO
+        /// endpoint for the tenant.
+        /// Cap: 5 connections.
+        /// HTTP/2 disabled — compliance endpoints are HTTP/1.1 only.
+        /// </summary>
+        private static HttpClient BuildComplianceClient() => new HttpClient(new SocketsHttpHandler
+        {
+            AutomaticDecompression         = DecompressionMethods.All,
+            PooledConnectionLifetime       = TimeSpan.FromMinutes(30),
+            PooledConnectionIdleTimeout    = TimeSpan.FromMinutes(2),
+            EnableMultipleHttp2Connections = false,
+            AllowAutoRedirect              = false,  // 3xx IS the expected response here
+            MaxConnectionsPerServer        = 5,
+        }) { Timeout = Timeout.InfiniteTimeSpan };
+
+        /// <summary>
+        /// Partner Center client — dedicated lane for high-frequency partner
+        /// APIs so they do not compete with default traffic.
+        /// Covers api.partnercenter.microsoft.com and related subdomains.
+        /// Cap: 5 connections.
+        /// </summary>
+        private static HttpClient BuildPartnerCenterClient() => new HttpClient(new SocketsHttpHandler
+        {
+            AutomaticDecompression         = DecompressionMethods.All,
+            PooledConnectionLifetime       = TimeSpan.FromMinutes(30),
+            PooledConnectionIdleTimeout    = TimeSpan.FromMinutes(2),
+            EnableMultipleHttp2Connections = true,
+            AllowAutoRedirect              = true,
+            MaxAutomaticRedirections       = 10,
+            MaxConnectionsPerServer        = 5,
+        }) { Timeout = Timeout.InfiniteTimeSpan };
+
+        /// <summary>
+        /// Admin plane client — dedicated lane for Microsoft admin/reporting
+        /// surfaces (Admin Center, Office reports, Defender APIs, etc.).
+        /// Cap: 5 connections.
+        /// </summary>
+        private static HttpClient BuildAdminPlaneClient() => new HttpClient(new SocketsHttpHandler
+        {
+            AutomaticDecompression         = DecompressionMethods.All,
+            PooledConnectionLifetime       = TimeSpan.FromMinutes(30),
+            PooledConnectionIdleTimeout    = TimeSpan.FromMinutes(2),
+            EnableMultipleHttp2Connections = true,
+            AllowAutoRedirect              = true,
+            MaxAutomaticRedirections       = 10,
+            MaxConnectionsPerServer        = 5,
+        }) { Timeout = Timeout.InfiniteTimeSpan };
+
+        /// <summary>
+        /// SharePoint / OneDrive client — dedicated lane for SPO admin CSOM (ProcessQuery) and
+        /// SPO REST (_api) against *.sharepoint.com, which have no server-side $batch. Concurrent
+        /// per-site writes (Set-CIPPSPOSiteBulk via SendConcurrent) fan out here. HTTP/2 is disabled
+        /// so MaxConnectionsPerServer is a true concurrency ceiling (5) rather than a connection count
+        /// that H2 stream-multiplexing could exceed. Measured on a 526-site tenant, 5 in flight throttled
+        /// far less than 8-10 (43 vs 56 x HTTP 429) and finished sooner — SPO's CSOM-admin throttle is a
+        /// sustained-rate limit, so a lower ceiling plus the once-per-24h sweep guard is the throttle-safe
+        /// combination. Cap: 5 connections.
+        /// </summary>
+        private static HttpClient BuildSpoClient() => new HttpClient(new SocketsHttpHandler
+        {
+            AutomaticDecompression         = DecompressionMethods.All,
+            PooledConnectionLifetime       = TimeSpan.FromMinutes(30),
+            PooledConnectionIdleTimeout    = TimeSpan.FromMinutes(2),
+            EnableMultipleHttp2Connections = false,
+            AllowAutoRedirect              = true,
+            MaxAutomaticRedirections       = 10,
+            MaxConnectionsPerServer        = 5,
+        }) { Timeout = Timeout.InfiniteTimeSpan };
+
+        /// <summary>
+        /// DNS client — dedicated lane for DoH (DNS-over-HTTPS) providers.
+        /// Covers dns.google.com and cloudflare-dns.com. These services
+        /// heavily load-balance across many server IPs, so a low per-server
+        /// cap avoids spreading connections across dozens of backends.
+        /// Cap: 2 connections per server.
+        /// </summary>
+        private static HttpClient BuildDnsClient() => new HttpClient(new SocketsHttpHandler
+        {
+            AutomaticDecompression         = DecompressionMethods.All,
+            PooledConnectionLifetime       = TimeSpan.FromMinutes(30),
+            PooledConnectionIdleTimeout    = TimeSpan.FromMinutes(2),
+            EnableMultipleHttp2Connections = false,
+            AllowAutoRedirect              = true,
+            MaxAutomaticRedirections       = 5,
+            MaxConnectionsPerServer        = 2,
+        }) { Timeout = Timeout.InfiniteTimeSpan };
+
+        /// <summary>
+        /// Default catch-all client — handles any hostname not matched by the
+        /// routing switch, including unknown Microsoft endpoints and any
+        /// third-party APIs called via this wrapper.
+        /// Cap: 5 connections. This also absorbs the small number of legacy
+        /// Invoke-RestMethod calls that bypass the pool entirely, which consume
+        /// ports outside our accounting.
+        /// </summary>
+        private static HttpClient BuildDefaultClient() => new HttpClient(new SocketsHttpHandler
+        {
+            AutomaticDecompression         = DecompressionMethods.All,
+            PooledConnectionLifetime       = TimeSpan.FromMinutes(30),
+            PooledConnectionIdleTimeout    = TimeSpan.FromMinutes(2),
+            EnableMultipleHttp2Connections = true,
+            AllowAutoRedirect              = true,
+            MaxAutomaticRedirections       = 10,
+            MaxConnectionsPerServer        = 5,
+        }) { Timeout = Timeout.InfiniteTimeSpan };
+
+        // -----------------------------------------------------------------
+        // Lazy initialisation — double-checked locking via SemaphoreSlim
+        // -----------------------------------------------------------------
+        // All five clients are initialised together in a single lock pass to
+        // avoid partial initialisation states where some clients are ready and
+        // others are not. The null check outside the semaphore is the "fast
+        // path" — once all clients exist no locking overhead is incurred.
+        // -----------------------------------------------------------------
+        private static async Task EnsureClientsAsync()
+        {
+            // Fast path — all clients already initialised
+            if (_graphClient      is not null &&
+                _exoClient        is not null &&
+                _loginClient      is not null &&
+                _complianceClient is not null &&
+                _partnerCenterClient is not null &&
+                _adminPlaneClient is not null &&
+                _spoClient        is not null &&
+                _dnsClient        is not null &&
+                _defaultClient    is not null)
+                return;
+
+            await _initLock.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                // Re-check inside the lock (double-checked locking pattern)
+                if (_graphClient is null)
+                {
+                    _graphClient      = BuildGraphClient();
+                    _exoClient        = BuildExoClient();
+                    _loginClient      = BuildLoginClient();
+                    _complianceClient = BuildComplianceClient();
+                    _partnerCenterClient = BuildPartnerCenterClient();
+                    _adminPlaneClient = BuildAdminPlaneClient();
+                    _spoClient        = BuildSpoClient();
+                    _dnsClient        = BuildDnsClient();
+                    _defaultClient    = BuildDefaultClient();
+                }
+            }
+            finally
+            {
+                _initLock.Release();
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // Client routing
+        // -----------------------------------------------------------------
+        // Selects the appropriate singleton client based on the request URI
+        // and the MaximumRedirection flag.
+        //
+        // ROUTING RULES (evaluated in order):
+        //   1. noRedirect flag OR *.compliance.microsoft.com
+        //      → complianceClient (AllowAutoRedirect = false)
+        //   2. *.graph.microsoft.com
+        //      → graphClient
+        //   3. login.microsoftonline.com
+        //      → loginClient
+        //   4. outlook.office365.com / outlook.office.com / outlook.com /
+        //      *.protection.outlook.com
+        //      → exoClient
+        //   5. Everything else
+        //      → defaultClient
+        //
+        // NOTE: The compliance check is first because a compliance URL may
+        // technically match other patterns (e.g. *.microsoft.com) but must
+        // always use the no-redirect client regardless.
+        // -----------------------------------------------------------------
+        private static (HttpClient Client, string Pool, string Host) SelectClient(string uri, bool noRedirect)
+        {
+            var requestUri = new Uri(uri);
+            var host = requestUri.Host;
+
+            // Rule 1 — compliance / no-redirect always wins
+            if (noRedirect || host.EndsWith(".compliance.microsoft.com",
+                StringComparison.OrdinalIgnoreCase))
+                return (_complianceClient!, "Compliance", host);
+
+            // Rule 1b — compliance InvokeCommand (needs redirects, but NOT HTTP/2)
+            // These are the regional compliance endpoints like nam10b.ps.compliance.protection.outlook.com
+            // They must be checked BEFORE the EXO *.protection.outlook.com rule.
+            if (host.EndsWith(".compliance.protection.outlook.com", StringComparison.OrdinalIgnoreCase)
+                || host.Equals("ps.compliance.protection.outlook.com", StringComparison.OrdinalIgnoreCase))
+                return (_loginClient!, "Compliance", host);
+
+            return host switch
+            {
+                // Rule 2 — Graph
+                var h when h.Equals("graph.microsoft.com",
+                    StringComparison.OrdinalIgnoreCase)                    => (_graphClient!, "Graph", host),
+                var h when h.EndsWith(".graph.microsoft.com",
+                    StringComparison.OrdinalIgnoreCase)                    => (_graphClient!, "Graph", host),
+
+                // Rule 3 — Login / token acquisition
+                var h when h.Equals("login.microsoftonline.com",
+                    StringComparison.OrdinalIgnoreCase)                    => (_loginClient!, "Login", host),
+                var h when h.Equals("login.microsoftonline.us",
+                    StringComparison.OrdinalIgnoreCase)                    => (_loginClient!, "Login", host),
+                var h when h.Equals("login.windows.net",
+                    StringComparison.OrdinalIgnoreCase)                    => (_loginClient!, "Login", host),
+
+                // Rule 4 — EXO / Outlook endpoints
+                var h when h.Equals("outlook.office365.com",
+                    StringComparison.OrdinalIgnoreCase)                    => (_exoClient!, "Exo", host),
+                var h when h.Equals("outlook.office.com",
+                    StringComparison.OrdinalIgnoreCase)                    => (_exoClient!, "Exo", host),
+                var h when h.EndsWith(".outlook.com",
+                    StringComparison.OrdinalIgnoreCase)                    => (_exoClient!, "Exo", host),
+                var h when h.EndsWith(".protection.outlook.com",
+                    StringComparison.OrdinalIgnoreCase)                    => (_exoClient!, "Exo", host),
+
+                // Rule 5 — Partner Center dedicated lane
+                var h when h.Equals("api.partnercenter.microsoft.com",
+                    StringComparison.OrdinalIgnoreCase)                    => (_partnerCenterClient!, "PartnerCenter", host),
+                var h when h.EndsWith(".partnercenter.microsoft.com",
+                    StringComparison.OrdinalIgnoreCase)                    => (_partnerCenterClient!, "PartnerCenter", host),
+
+                // Rule 6 — Microsoft admin/reporting/security lanes
+                var h when IsAdminPlaneHost(h)                             => (_adminPlaneClient!, "AdminPlane", host),
+
+                // Rule 6b — SharePoint / OneDrive (CSOM ProcessQuery + _api REST). Covers the
+                // tenant, -admin and -my hosts. No server-side $batch, so concurrent per-site
+                // requests fan out here, capped at 10 connections.
+                var h when h.EndsWith(".sharepoint.com",
+                    StringComparison.OrdinalIgnoreCase)                    => (_spoClient!, "SPO", host),
+
+                // Rule 7 — DNS-over-HTTPS providers (low connection cap)
+                var h when h.Equals("dns.google.com",
+                    StringComparison.OrdinalIgnoreCase)                    => (_dnsClient!, "DNS", host),
+                var h when h.Equals("cloudflare-dns.com",
+                    StringComparison.OrdinalIgnoreCase)                    => (_dnsClient!, "DNS", host),
+
+                // Rule 8 — catch-all
+                _                                                           => (_defaultClient!, "Default", host),
+            };
+        }
+
+        private static bool IsAdminPlaneHost(string host) => host switch
+        {
+            var h when h.Equals("admin.microsoft.com", StringComparison.OrdinalIgnoreCase) => true,
+            var h when h.Equals("manage.office.com", StringComparison.OrdinalIgnoreCase) => true,
+            var h when h.Equals("reports.office.com", StringComparison.OrdinalIgnoreCase) => true,
+            var h when h.Equals("api.securitycenter.microsoft.com", StringComparison.OrdinalIgnoreCase) => true,
+            var h when h.Equals("licensing.m365.microsoft.com", StringComparison.OrdinalIgnoreCase) => true,
+            var h when h.Equals("substrate.office.com", StringComparison.OrdinalIgnoreCase) => true,
+            _ => false,
+        };
+
+        private static void TrackPoolSelection(string pool, string host)
+        {
+            _poolSelections.AddOrUpdate(pool, 1, static (_, current) => current + 1);
+            _hostSelections.AddOrUpdate(host, 1, static (_, current) => current + 1);
+        }
+
+        private static void TrackPoolResult(string pool, bool success, int statusCode)
+        {
+            if (success)
+                _poolSuccesses.AddOrUpdate(pool, 1, static (_, current) => current + 1);
+            else
+                _poolFailures.AddOrUpdate(pool, 1, static (_, current) => current + 1);
+
+            _statusCodes.AddOrUpdate(statusCode, 1, static (_, current) => current + 1);
+        }
+
+        private static void TrackTransportError(string pool)
+        {
+            _poolTransportErrors.AddOrUpdate(pool, 1, static (_, current) => current + 1);
+        }
+
+        // -----------------------------------------------------------------
+        // Public entry point — synchronous wrapper for PowerShell
+        // -----------------------------------------------------------------
+        // PowerShell cannot natively await Tasks, so this synchronous shim
+        // calls SendAsync via GetAwaiter().GetResult(). This is safe here
+        // because Azure Functions PowerShell workers do not have a
+        // SynchronizationContext that could deadlock on .Result/.GetResult().
+        // -----------------------------------------------------------------
+        public static HttpResult Send(
+            string                      uri,
+            string                      method             = "GET",
+            string?                     body               = null,
+            Dictionary<string, string>? headers            = null,
+            string?                     contentType        = null,
+            bool                        skipErrorCheck     = false,
+            int                         timeoutSec         = 100,
+            int                         maximumRedirection = -1)
+        {
+            return SendAsync(uri, method, body, headers, contentType,
+                             skipErrorCheck, timeoutSec, maximumRedirection)
+                   .GetAwaiter().GetResult();
+        }
+
+        // -----------------------------------------------------------------
+        // Core async implementation
+        // -----------------------------------------------------------------
+        public static async Task<HttpResult> SendAsync(
+            string                      uri,
+            string                      method             = "GET",
+            string?                     body               = null,
+            Dictionary<string, string>? headers            = null,
+            string?                     contentType        = null,
+            bool                        skipErrorCheck     = false,
+            int                         timeoutSec         = 100,
+            int                         maximumRedirection = -1)
+        {
+            await EnsureClientsAsync().ConfigureAwait(false);
+
+            // Select the correct pooled client for this URI
+            bool noRedirect = maximumRedirection == 0;
+            var selection = SelectClient(uri, noRedirect);
+            var client = selection.Client;
+            TrackPoolSelection(selection.Pool, selection.Host);
+
+            using var request = new HttpRequestMessage(new HttpMethod(method), new Uri(uri));
+
+            // ----------------------------------------------------------
+            // Headers
+            // ----------------------------------------------------------
+            // HttpRequestMessage.Headers only accepts request headers
+            // (e.g. Authorization, Accept). Content headers (e.g. Content-Type,
+            // Content-Encoding) must be set on the HttpContent object.
+            // Headers that are rejected by TryAddWithoutValidation are deferred
+            // and applied to the content once it is created below.
+            // ----------------------------------------------------------
+            var deferredContentHeaders = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            if (headers is not null)
+            {
+                foreach (var (key, value) in headers)
+                {
+                    if (!request.Headers.TryAddWithoutValidation(key, value))
+                        deferredContentHeaders[key] = value;
+                }
+            }
+
+            // ----------------------------------------------------------
+            // Body serialisation
+            // ----------------------------------------------------------
+            // The body arrives from PowerShell as a pre-serialised string
+            // (the PS wrapper handles Hashtable → form-encode and
+            // PSObject → JSON conversion). We only need to wrap it in
+            // StringContent with the correct encoding and media type.
+            //
+            // Content-Type parsing splits on ';' to separate the media type
+            // from any charset parameter, then re-applies the full value so
+            // that 'application/json; charset=utf-8' round-trips correctly.
+            // ----------------------------------------------------------
+            if (body is not null)
+            {
+                var effectiveCt   = string.IsNullOrWhiteSpace(contentType)
+                    ? "application/json; charset=utf-8"
+                    : contentType;
+
+                var ctParts       = effectiveCt.Split(';', StringSplitOptions.TrimEntries);
+                var mediaTypePart = ctParts[0];
+
+                var encoding = Encoding.UTF8;
+                foreach (var part in ctParts.Skip(1))
+                {
+                    if (part.StartsWith("charset=", StringComparison.OrdinalIgnoreCase))
+                    {
+                        var charsetName = part["charset=".Length..].Trim('"', '\'', ' ');
+                        try { encoding = Encoding.GetEncoding(charsetName); } catch { /* keep UTF-8 */ }
+                        break;
+                    }
+                }
+
+                request.Content = new StringContent(body, encoding, mediaTypePart);
+
+                // Re-apply the exact Content-Type the caller specified.
+                // StringContent's constructor auto-appends "; charset=utf-8"
+                // which breaks APIs that require a bare media type (e.g. "text/css").
+                request.Content.Headers.Remove("Content-Type");
+                request.Content.Headers.TryAddWithoutValidation("Content-Type", effectiveCt);
+            }
+
+            // Apply any deferred content headers (e.g. Content-Encoding)
+            foreach (var (key, value) in deferredContentHeaders)
+            {
+                request.Content ??= new StringContent(string.Empty, Encoding.UTF8);
+                request.Content.Headers.Remove(key);
+                request.Content.Headers.TryAddWithoutValidation(key, value);
+            }
+
+            // ----------------------------------------------------------
+            // Per-request timeout via CancellationToken
+            // ----------------------------------------------------------
+            // HttpClient.Timeout is set to InfiniteTimeSpan on all singleton
+            // clients so a shared timeout cannot fire across unrelated requests.
+            // Instead we create a CancellationTokenSource per request with the
+            // caller-specified timeout. timeoutSec = 0 means no timeout.
+            // ----------------------------------------------------------
+            using var cts = timeoutSec > 0
+                ? new CancellationTokenSource(TimeSpan.FromSeconds(timeoutSec))
+                : null;
+            var token = cts?.Token ?? CancellationToken.None;
+
+            // ----------------------------------------------------------
+            // Send
+            // ----------------------------------------------------------
+            HttpResponseMessage response;
+            try
+            {
+                // ResponseHeadersRead: do NOT buffer the body inside SendAsync. With the
+                // default (ResponseContentRead) the body is downloaded and auto-decompressed
+                // here, so a mislabeled Content-Encoding (EXO error responses declare gzip on
+                // a plain body) throws InvalidDataException from SendAsync and bypasses the
+                // defensive body read below — masking the HTTP status the caller needs.
+                response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (cts is not null && cts.IsCancellationRequested)
+            {
+                // Our per-request timeout CTS actually fired — this is a genuine
+                // client-side timeout after timeoutSec. Let it propagate as an
+                // OperationCanceledException so the PowerShell wrapper reports it
+                // as a timeout (and the "timed out after {timeoutSec}s" message is true).
+                TrackTransportError(selection.Pool);
+                throw;
+            }
+            catch (OperationCanceledException ex)
+            {
+                // Cancellation was NOT triggered by our timeout token. The server
+                // reset/closed the request before our timeout elapsed — common for
+                // slow EXO InvokeCommand cmdlets (Search-UnifiedAuditLog,
+                // Get-MessageTraceV2) which the service cuts off well under 100s.
+                // Surface it as a transport error so it is not mislabeled as a
+                // client timeout and is correctly treated as a retryable failure.
+                TrackTransportError(selection.Pool);
+                throw new HttpRequestException(
+                    $"The request to '{uri}' was canceled by the server before completing.", ex);
+            }
+            catch
+            {
+                TrackTransportError(selection.Pool);
+                throw;
+            }
+
+            using (response)
+            {
+                var statusCode = (int)response.StatusCode;
+
+                // Read the body defensively. With AutomaticDecompression enabled, ReadAsStringAsync can throw
+                // (InvalidDataException "...unsupported compression method", IOException, ...) when a response
+                // carries a Content-Encoding the handler cannot decode or a malformed/mislabeled body. Such a
+                // read failure must NOT mask the HTTP status: for an error response we surface the status code
+                // (the actionable signal - e.g. a 403 from EXO), and for a success response we surface a clear,
+                // attributable error instead of an opaque decompression exception. Callers that skip the error
+                // check (e.g. redirect / compliance-URL discovery) keep their headers and fall back to an empty body.
+                string content;
+                try
+                {
+                    content = response.Content is not null
+                        ? await ReadDecodedContentAsync(response.Content, token).ConfigureAwait(false)
+                        : string.Empty;
+                }
+                catch (Exception ex) when (ex is InvalidDataException || ex is IOException)
+                {
+                    if (!(skipErrorCheck || noRedirect))
+                    {
+                        TrackPoolResult(selection.Pool, response.IsSuccessStatusCode, statusCode);
+                        var readFailMessage = !response.IsSuccessStatusCode
+                            ? $"Response status code does not indicate success: {statusCode}"
+                            : $"Failed to read response body (status {statusCode}): {ex.Message}";
+                        throw new HttpRequestException(readFailMessage, ex, response.StatusCode);
+                    }
+                    content = string.Empty;
+                }
+
+            // ----------------------------------------------------------
+            // Response headers
+            // ----------------------------------------------------------
+            // Combine response headers and content headers into one dictionary
+            // so the PowerShell wrapper can surface them via -ResponseHeadersVariable
+            // with the same shape as Invoke-RestMethod.
+            // ----------------------------------------------------------
+                var allHeaders = new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase);
+                foreach (var h in response.Headers)
+                    allHeaders[h.Key] = h.Value.ToArray();
+                if (response.Content is not null)
+                    foreach (var h in response.Content.Headers)
+                        allHeaders[h.Key] = h.Value.ToArray();
+
+            // ----------------------------------------------------------
+            // Error handling
+            // ----------------------------------------------------------
+            // When MaximumRedirection == 0 we always skip the error check
+            // because the compliance client expects a 3xx response — the
+            // redirect Location header IS the result we want.
+            // ----------------------------------------------------------
+                bool effectiveSkipCheck = skipErrorCheck || noRedirect;
+                TrackPoolResult(selection.Pool, response.IsSuccessStatusCode, statusCode);
+                if (!effectiveSkipCheck && !response.IsSuccessStatusCode)
+                    throw new HttpRequestException(
+                        $"Response status code does not indicate success: {statusCode}",
+                        inner: null,
+                        statusCode: response.StatusCode);
+
+            // ----------------------------------------------------------
+            // JSON detection
+            // ----------------------------------------------------------
+            // Check Content-Type first, then fall back to sniffing the first
+            // character of the body. This handles APIs that return JSON with
+            // a non-standard or missing Content-Type header.
+            // ----------------------------------------------------------
+                var mediaType = response.Content?.Headers.ContentType?.MediaType ?? string.Empty;
+                var trimmed   = content.TrimStart();
+                var isJson    = mediaType.Contains("application/json", StringComparison.OrdinalIgnoreCase)
+                             || trimmed.StartsWith('{')
+                             || trimmed.StartsWith('[');
+
+                return new HttpResult
+                {
+                    StatusCode      = statusCode,
+                    IsSuccess       = response.IsSuccessStatusCode,
+                    Content         = content,
+                    IsJson          = isJson,
+                    ResponseHeaders = allHeaders,
+                };
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // Concurrent fan-out — one PowerShell call, many async requests
+        // -----------------------------------------------------------------
+        // PowerShell passes a list of requests (each already carrying its auth
+        // header) and gets back one result per request, in order. Concurrency is
+        // bounded by maxConcurrency here AND by each destination's
+        // MaxConnectionsPerServer cap, whichever is tighter. 429/5xx are retried
+        // with Retry-After (when present) or exponential backoff with jitter. A
+        // single request's failure is captured, never thrown, so the batch always
+        // completes and the caller can act on partial success.
+        //
+        // Synchronous shim for PowerShell (cannot await Tasks natively). Safe here
+        // for the same reason Send() is — no SynchronizationContext to deadlock on.
+        // -----------------------------------------------------------------
+        public static CIPPConcurrentResult[] SendConcurrent(
+            IEnumerable<CIPPConcurrentRequest> requests,
+            int maxConcurrency = 8,
+            int maxRetries     = 3)
+        {
+            return SendConcurrentAsync(requests, maxConcurrency, maxRetries)
+                   .GetAwaiter().GetResult();
+        }
+
+        public static async Task<CIPPConcurrentResult[]> SendConcurrentAsync(
+            IEnumerable<CIPPConcurrentRequest> requests,
+            int maxConcurrency = 8,
+            int maxRetries     = 3)
+        {
+            var list = requests is null ? new List<CIPPConcurrentRequest>() : requests.ToList();
+            if (list.Count == 0) return Array.Empty<CIPPConcurrentResult>();
+            if (maxConcurrency < 1) maxConcurrency = 1;
+            if (maxRetries    < 0) maxRetries     = 0;
+
+            using var gate = new SemaphoreSlim(maxConcurrency, maxConcurrency);
+            var tasks = new Task<CIPPConcurrentResult>[list.Count];
+            for (int i = 0; i < list.Count; i++)
+            {
+                int index = i;
+                var req   = list[i];
+                tasks[i] = Task.Run(async () =>
+                {
+                    await gate.WaitAsync().ConfigureAwait(false);
+                    try   { return await SendOneWithRetryAsync(index, req, maxRetries).ConfigureAwait(false); }
+                    finally { gate.Release(); }
+                });
+            }
+            return await Task.WhenAll(tasks).ConfigureAwait(false);
+        }
+
+        private static async Task<CIPPConcurrentResult> SendOneWithRetryAsync(
+            int index, CIPPConcurrentRequest req, int maxRetries)
+        {
+            var attempt = 0;
+            while (true)
+            {
+                attempt++;
+                try
+                {
+                    // skipErrorCheck: 429/5xx must come back as results (not thrown) so we can
+                    // decide whether to retry; the caller inspects StatusCode/Content itself.
+                    var res = await SendAsync(req.Uri, req.Method, req.Body, req.Headers,
+                                              req.ContentType, skipErrorCheck: true,
+                                              timeoutSec: req.TimeoutSec,
+                                              maximumRedirection: req.MaximumRedirection).ConfigureAwait(false);
+
+                    var retryable = res.StatusCode == 429 || (res.StatusCode >= 500 && res.StatusCode <= 599);
+                    if (retryable && attempt <= maxRetries)
+                    {
+                        await Task.Delay(RetryDelay(res, attempt)).ConfigureAwait(false);
+                        continue;
+                    }
+                    return new CIPPConcurrentResult
+                    {
+                        Index = index, IsSuccess = res.IsSuccess, StatusCode = res.StatusCode,
+                        Result = res, Attempts = attempt,
+                    };
+                }
+                catch (Exception ex)
+                {
+                    if (attempt <= maxRetries)
+                    {
+                        await Task.Delay(RetryDelay(null, attempt)).ConfigureAwait(false);
+                        continue;
+                    }
+                    return new CIPPConcurrentResult
+                    {
+                        Index = index, IsSuccess = false, StatusCode = 0,
+                        Error = ex.Message, Attempts = attempt,
+                    };
+                }
+            }
+        }
+
+        private static TimeSpan RetryDelay(HttpResult? res, int attempt)
+        {
+            // Honour a sane Retry-After (seconds) when the server sends one.
+            if (res is not null &&
+                res.ResponseHeaders.TryGetValue("Retry-After", out var ra) &&
+                ra.Length > 0 && int.TryParse(ra[0], out var secs) && secs > 0 && secs <= 300)
+                return TimeSpan.FromSeconds(secs);
+
+            // Otherwise exponential backoff (1s, 2s, 4s, capped 8s) with jitter.
+            var baseMs = Math.Min(8000, 1000 * (int)Math.Pow(2, attempt - 1));
+            return TimeSpan.FromMilliseconds(baseMs + Random.Shared.Next(0, 1000));
+        }
+
+        // -----------------------------------------------------------------
+        // Content decoding
+        // -----------------------------------------------------------------
+        // Reads the response body as a string, decompressing explicitly based on
+        // the Content-Encoding header. SocketsHttpHandler.AutomaticDecompression
+        // normally handles this transparently AND strips Content-Encoding, in
+        // which case ContentEncoding is empty here and we just read the string.
+        // But AutomaticDecompression silently no-ops whenever a request carries a
+        // caller-supplied Accept-Encoding header (HttpClient assumes the caller
+        // will decode), and some endpoints (e.g. the Teams ConfigAPI) return gzip
+        // even when unprompted. When Content-Encoding survives, we decode it here
+        // so callers never receive raw compressed bytes. Idempotent: if the
+        // handler already decoded, there's nothing left to do.
+        // -----------------------------------------------------------------
+        private static async Task<string> ReadDecodedContentAsync(HttpContent httpContent, CancellationToken token)
+        {
+            var encodings = httpContent.Headers.ContentEncoding;
+            if (encodings is null || encodings.Count == 0)
+                return await httpContent.ReadAsStringAsync(token).ConfigureAwait(false);
+
+            var raw = await httpContent.ReadAsStreamAsync(token).ConfigureAwait(false);
+            Stream decoded = raw;
+            // Content-Encoding lists encodings in the order applied; decode in reverse.
+            foreach (var enc in encodings.Reverse())
+            {
+                decoded = enc?.Trim().ToLowerInvariant() switch
+                {
+                    "gzip" or "x-gzip" => new GZipStream(decoded, CompressionMode.Decompress),
+                    "deflate"          => new DeflateStream(decoded, CompressionMode.Decompress),
+                    "br"               => new BrotliStream(decoded, CompressionMode.Decompress),
+                    "identity" or "" or null => decoded,
+                    _                  => decoded,
+                };
+            }
+            using var reader = new StreamReader(decoded, Encoding.UTF8);
+            var result = await reader.ReadToEndAsync(token).ConfigureAwait(false);
+            decoded.Dispose();
+            return result;
+        }
+
+        // =================================================================
+        // Diagnostics
+        // =================================================================
+        // Returns a JSON string describing the current pool configuration.
+        // Call this from profile.ps1 on startup to verify the configuration
+        // is live and to establish a baseline in your function app logs.
+        //
+        // HOW TO MONITOR POOL HEALTH
+        // --------------------------
+        // 1. STARTUP BASELINE (profile.ps1)
+        //    Add-Type -Path "$PSScriptRoot/CIPP.dll"
+        //    $diag = [CIPP.CIPPRestClient]::GetDiagnostics()
+        //    Write-Host "CIPPRestClient config: $diag"
+        //
+        // 2. AZURE MONITOR / APP INSIGHTS
+        //    The most useful metric for SNAT health is:
+        //      Metric: "SNAT Connection Count" (under Networking in the portal)
+        //      Alert:  > 100 connections sustained for > 5 minutes
+        //    Also watch:
+        //      "Connection Errors" for failed port allocations
+        //      "Http 5xx" spike often correlates with SNAT exhaustion
+        //
+        // 3. KUSTO QUERY (App Insights / Log Analytics)
+        //    Use this to correlate SNAT port usage with function invocations:
+        //
+        //    AzureMetrics
+        //    | where MetricName == "SnatConnectionCount"
+        //    | summarize avg(Average), max(Maximum) by bin(TimeGenerated, 1m)
+        //    | render timechart
+        //
+        // 4. WHAT HEALTHY LOOKS LIKE
+        //    - SNAT count rises quickly during ramp-up then plateaus
+        //    - Plateau value is well below 110 (your allocated budget)
+        //    - No "connection refused" or socket exhaustion errors in logs
+        //    - Port count does NOT grow linearly with request volume
+        //
+        // 5. WHAT UNHEALTHY LOOKS LIKE
+        //    - SNAT count continuously climbing with no plateau
+        //    - Errors containing "An attempt was made to access a socket in
+        //      a way forbidden by its access permissions"
+        //    - HTTP 500s or timeouts correlating with high concurrency periods
+        //
+        // 6. POOL SATURATION (requests queuing inside the handler)
+        //    There is no built-in .NET metric for "requests waiting for a
+        //    pooled connection". If you suspect queuing is adding latency,
+        //    instrument SendAsync with a Stopwatch before and after
+        //    client.SendAsync and log the delta. Long pre-send waits with no
+        //    network activity indicate pool saturation — raise the cap for
+        //    that client group or reduce concurrency.
+        // =================================================================
+        public static string GetDiagnostics()
+        {
+            return JsonSerializer.Serialize(new
+            {
+                Initialized = _graphClient is not null,
+                PoolUsage = new
+                {
+                    Selections = _poolSelections.OrderBy(kvp => kvp.Key)
+                        .ToDictionary(kvp => kvp.Key, kvp => kvp.Value),
+                    Successes = _poolSuccesses.OrderBy(kvp => kvp.Key)
+                        .ToDictionary(kvp => kvp.Key, kvp => kvp.Value),
+                    Failures = _poolFailures.OrderBy(kvp => kvp.Key)
+                        .ToDictionary(kvp => kvp.Key, kvp => kvp.Value),
+                    TransportErrors = _poolTransportErrors.OrderBy(kvp => kvp.Key)
+                        .ToDictionary(kvp => kvp.Key, kvp => kvp.Value),
+                    TopHosts = _hostSelections
+                        .OrderByDescending(kvp => kvp.Value)
+                        .ThenBy(kvp => kvp.Key, StringComparer.OrdinalIgnoreCase)
+                        .Take(25)
+                        .Select(kvp => new { Host = kvp.Key, Requests = kvp.Value })
+                        .ToArray(),
+                    StatusCodes = _statusCodes
+                        .OrderBy(kvp => kvp.Key)
+                        .ToDictionary(kvp => kvp.Key.ToString(), kvp => kvp.Value),
+                },
+            }, new JsonSerializerOptions { WriteIndented = true });
+        }
+
+        /// <summary>
+        /// Resets the runtime pool telemetry counters. Intended for the
+        /// diagnostics profile endpoint so operators can clear the counts
+        /// between observation windows without restarting the worker.
+        /// </summary>
+        public static void ResetDiagnostics()
+        {
+            _poolSelections.Clear();
+            _poolSuccesses.Clear();
+            _poolFailures.Clear();
+            _poolTransportErrors.Clear();
+            _hostSelections.Clear();
+            _statusCodes.Clear();
+        }
+    }
+
+    public sealed class TokenCacheLookupResult
+    {
+        public bool   Found            { get; init; }
+        public string TokenPayloadJson { get; init; } = string.Empty;
+        public long   ExpiresOnUnix    { get; init; }
+    }
+
+    // =====================================================================
+    // CIPPTokenCache
+    // =====================================================================
+    // Process-wide token cache shared by all runspaces in the worker process.
+    // The cache is intentionally generic: PowerShell constructs the key and
+    // controls token acquisition semantics. C# only handles storage, expiry,
+    // and lightweight diagnostics.
+    // =====================================================================
+    public static class CIPPTokenCache
+    {
+        private sealed class TokenCacheEntry
+        {
+            public string TokenPayloadJson { get; init; } = string.Empty;
+            public long   ExpiresOnUnix    { get; init; }
+            public long   CachedAtUnix     { get; init; }
+        }
+
+        private static readonly ConcurrentDictionary<string, TokenCacheEntry> _entries =
+            new(StringComparer.OrdinalIgnoreCase);
+
+        // Per-key semaphores to prevent thundering herd / cache stampede.
+        // When multiple runspaces miss the cache for the same key simultaneously,
+        // only one acquires a token while the others wait and reuse the result.
+        private static readonly ConcurrentDictionary<string, SemaphoreSlim> _keyLocks =
+            new(StringComparer.OrdinalIgnoreCase);
+
+        private static long _hits;
+        private static long _misses;
+        private static long _sets;
+        private static long _invalidations;
+        private static long _expiredRemovals;
+        private static long _lockWaits;
+
+        public static string BuildKey(
+            string tenantId,
+            string scope,
+            bool asApp,
+            string? clientId,
+            string? grantType)
+        {
+            return string.Join("|",
+                (tenantId ?? string.Empty).Trim().ToLowerInvariant(),
+                (scope ?? string.Empty).Trim().ToLowerInvariant(),
+                asApp ? "app" : "delegated",
+                (clientId ?? string.Empty).Trim().ToLowerInvariant(),
+                (grantType ?? string.Empty).Trim().ToLowerInvariant());
+        }
+
+        public static TokenCacheLookupResult Lookup(string key, int refreshSkewSeconds = 120)
+        {
+            if (string.IsNullOrWhiteSpace(key))
+            {
+                Interlocked.Increment(ref _misses);
+                return new TokenCacheLookupResult { Found = false };
+            }
+
+            if (!_entries.TryGetValue(key, out var entry))
+            {
+                Interlocked.Increment(ref _misses);
+                return new TokenCacheLookupResult { Found = false };
+            }
+
+            var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            var refreshBoundary = entry.ExpiresOnUnix - Math.Max(0, refreshSkewSeconds);
+            if (now >= refreshBoundary)
+            {
+                _entries.TryRemove(key, out _);
+                Interlocked.Increment(ref _expiredRemovals);
+                Interlocked.Increment(ref _misses);
+                return new TokenCacheLookupResult { Found = false };
+            }
+
+            Interlocked.Increment(ref _hits);
+            return new TokenCacheLookupResult
+            {
+                Found            = true,
+                TokenPayloadJson = entry.TokenPayloadJson,
+                ExpiresOnUnix    = entry.ExpiresOnUnix,
+            };
+        }
+
+        public static void Store(string key, string tokenPayloadJson, long expiresOnUnix)
+        {
+            if (string.IsNullOrWhiteSpace(key) ||
+                string.IsNullOrWhiteSpace(tokenPayloadJson) ||
+                expiresOnUnix <= 0)
+                return;
+
+            _entries[key] = new TokenCacheEntry
+            {
+                TokenPayloadJson = tokenPayloadJson,
+                ExpiresOnUnix    = expiresOnUnix,
+                CachedAtUnix     = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+            };
+
+            Interlocked.Increment(ref _sets);
+        }
+
+        public static void Remove(string key)
+        {
+            if (string.IsNullOrWhiteSpace(key))
+                return;
+
+            if (_entries.TryRemove(key, out _))
+                Interlocked.Increment(ref _invalidations);
+        }
+
+        /// <summary>
+        /// Invalidate every cached token for a tenant, across all scopes, client IDs and
+        /// grant types. Call this after a consent change (CPV refresh/reset, permission
+        /// update) so the next request re-acquires a token carrying the new scopes instead
+        /// of serving a stale one that predates the consent.
+        /// Keys are built as "tenantId|scope|app-or-delegated|clientId|grantType", so the
+        /// tenant is matched on the first segment.
+        /// </summary>
+        public static int RemoveByTenant(string tenantId)
+        {
+            if (string.IsNullOrWhiteSpace(tenantId))
+                return 0;
+
+            var prefix = tenantId.Trim().ToLowerInvariant() + "|";
+            var removed = 0;
+
+            foreach (var kvp in _entries)
+            {
+                if (kvp.Key.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) &&
+                    _entries.TryRemove(kvp.Key, out _))
+                {
+                    removed++;
+                    Interlocked.Increment(ref _invalidations);
+                }
+            }
+
+            return removed;
+        }
+
+        /// <summary>
+        /// Invalidate the entire token cache. Intended for global consent/app changes
+        /// (for example rotating the SAM application) where per-tenant invalidation is
+        /// not sufficient.
+        /// </summary>
+        public static int Clear()
+        {
+            var removed = 0;
+
+            foreach (var kvp in _entries)
+            {
+                if (_entries.TryRemove(kvp.Key, out _))
+                {
+                    removed++;
+                    Interlocked.Increment(ref _invalidations);
+                }
+            }
+
+            return removed;
+        }
+
+        public static int CompactExpired(int refreshSkewSeconds = 0, int maxRemovals = 1000)
+        {
+            var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            var removed = 0;
+            var skew = Math.Max(0, refreshSkewSeconds);
+
+            foreach (var kvp in _entries)
+            {
+                if (removed >= maxRemovals)
+                    break;
+
+                if (now >= (kvp.Value.ExpiresOnUnix - skew) && _entries.TryRemove(kvp.Key, out _))
+                {
+                    removed++;
+                    Interlocked.Increment(ref _expiredRemovals);
+                }
+            }
+
+            return removed;
+        }
+
+        /// <summary>
+        /// Acquire a per-key lock to prevent thundering herd on cache miss.
+        /// Returns true if the lock was acquired within the timeout.
+        /// After acquiring, the caller should Lookup() again (double-check),
+        /// then acquire the token and Store() it, then ReleaseLock().
+        /// </summary>
+        public static bool AcquireLock(string key, int timeoutMs = 30000)
+        {
+            if (string.IsNullOrWhiteSpace(key))
+                return false;
+
+            var sem = _keyLocks.GetOrAdd(key, _ => new SemaphoreSlim(1, 1));
+            Interlocked.Increment(ref _lockWaits);
+            return sem.Wait(timeoutMs);
+        }
+
+        /// <summary>
+        /// Release the per-key lock after token acquisition and Store().
+        /// Safe to call even if AcquireLock returned false (no-ops gracefully).
+        /// </summary>
+        public static void ReleaseLock(string key)
+        {
+            if (string.IsNullOrWhiteSpace(key))
+                return;
+
+            if (_keyLocks.TryGetValue(key, out var sem))
+            {
+                try { sem.Release(); } catch (SemaphoreFullException) { /* already released */ }
+            }
+        }
+
+        public static string GetDiagnostics()
+        {
+            return JsonSerializer.Serialize(new
+            {
+                Entries = _entries.Count,
+                Hits = Interlocked.Read(ref _hits),
+                Misses = Interlocked.Read(ref _misses),
+                Sets = Interlocked.Read(ref _sets),
+                Invalidations = Interlocked.Read(ref _invalidations),
+                ExpiredRemovals = Interlocked.Read(ref _expiredRemovals),
+                LockWaits = Interlocked.Read(ref _lockWaits),
+                ActiveLocks = _keyLocks.Count,
+            }, new JsonSerializerOptions { WriteIndented = true });
+        }
+
+        public static void ResetDiagnostics()
+        {
+            Interlocked.Exchange(ref _hits, 0);
+            Interlocked.Exchange(ref _misses, 0);
+            Interlocked.Exchange(ref _sets, 0);
+            Interlocked.Exchange(ref _invalidations, 0);
+            Interlocked.Exchange(ref _expiredRemovals, 0);
+            Interlocked.Exchange(ref _lockWaits, 0);
+        }
+    }
+}

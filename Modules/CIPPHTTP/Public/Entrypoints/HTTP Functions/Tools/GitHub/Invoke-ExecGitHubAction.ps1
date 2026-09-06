@@ -1,0 +1,124 @@
+function Invoke-ExecGitHubAction {
+    <#
+    .SYNOPSIS
+        Invoke GitHub Action
+    .DESCRIPTION
+        Call GitHub API
+    .ROLE
+        CIPP.Extension.ReadWrite
+    .FUNCTIONALITY
+        Entrypoint,AnyTenant
+    #>
+    [CmdletBinding()]
+    param($Request, $TriggerMetadata)
+
+    $APIName = $Request.Params.CIPPEndpoint
+    $Headers = $Request.Headers
+
+    $Action = $Request.Query.Action ?? $Request.Body.Action
+
+    if ($Request.Query.Action) {
+        $Parameters = $Request.Query
+    } else {
+        $Parameters = $Request.Body
+    }
+
+    $SplatParams = $Parameters | Select-Object -ExcludeProperty Action, TenantFilter | ConvertTo-Json | ConvertFrom-Json -AsHashtable
+
+    switch ($Action) {
+        'Search' {
+            $SearchResults = Search-GitHub @SplatParams
+            $Results = @($SearchResults.items)
+            $Metadata = $SearchResults | Select-Object -Property total_count, incomplete_results
+        }
+        'GetFileContents' {
+            $Results = Get-GitHubFileContents @SplatParams
+        }
+        'GetBranches' {
+            $Results = @(Get-GitHubBranch @SplatParams)
+        }
+        'GetOrgs' {
+            try {
+                $Orgs = Invoke-GitHubApiRequest -Path 'user/orgs'
+                $Results = @($Orgs)
+            } catch {
+                $Results = @{
+                    resultText = 'You may not have permission to view organizations, check your PAT scopes and try again - {0}' -f $_.Exception.Message
+                    state      = 'error'
+                }
+            }
+        }
+        'GetFileTree' {
+            $Files = (Get-GitHubFileTree @SplatParams).tree | Where-Object { $_.path -match '.json$' } | Select-Object *, @{n = 'html_url'; e = { "https://github.com/$($SplatParams.FullName)/tree/$($SplatParams.Branch)/$($_.path)" } }
+            $Results = @($Files)
+        }
+        'ImportTemplate' {
+            try {
+                $Results = Import-CommunityTemplate @SplatParams
+                $ResultText = if ($Results -is [string]) { $Results } elseif ($Results.resultText) { $Results.resultText } else { 'Template imported' }
+                Write-LogMessage -headers $Headers -API $APIName -tenant 'Global' -message $ResultText -Sev 'Info'
+            } catch {
+                $ErrorMessage = Get-CippException -Exception $_
+                $Results = @{
+                    resultText = "Error importing template: $($ErrorMessage.NormalizedError)"
+                    state      = 'error'
+                }
+                Write-LogMessage -headers $Headers -API $APIName -tenant 'Global' -message $Results.resultText -Sev 'Error' -LogData $ErrorMessage
+            }
+        }
+        'CreateRepo' {
+            try {
+                Write-Information "Creating repository '$($SplatParams.Name)'"
+                $Repo = New-GitHubRepo @SplatParams
+                if ($Repo.id) {
+                    $Table = Get-CIPPTable -TableName CommunityRepos
+                    $RepoEntity = @{
+                        PartitionKey  = 'CommunityRepos'
+                        RowKey        = [string]$Repo.id
+                        Name          = [string]($Repo.name -replace ' ', '-')
+                        Description   = [string]$Repo.description
+                        URL           = [string]$Repo.html_url
+                        FullName      = [string]$Repo.full_name
+                        Owner         = [string]$Repo.owner.login
+                        Visibility    = [string]$Repo.visibility
+                        WriteAccess   = [bool]$Repo.permissions.push
+                        DefaultBranch = [string]$Repo.default_branch
+                        Permissions   = [string]($Repo.permissions | ConvertTo-Json -Compress)
+                    }
+                    Add-CIPPAzDataTableEntity @Table -Entity $RepoEntity -Force | Out-Null
+
+                    $Results = @{
+                        resultText = "Repository '$($Repo.name)' created"
+                        state      = 'success'
+                    }
+                    Write-LogMessage -headers $Headers -API $APIName -tenant 'Global' -message $Results.resultText -Sev 'Info'
+                }
+            } catch {
+                Write-Information (Get-CippException -Exception $_ | ConvertTo-Json)
+                $Results = @{
+                    resultText = 'You may not have permission to create repositories, check your PAT scopes and try again - {0}' -f $_.Exception.Message
+                    state      = 'error'
+                }
+                Write-LogMessage -headers $Headers -API $APIName -tenant 'Global' -message $Results.resultText -Sev 'Error'
+            }
+        }
+        default {
+            $Results = @{
+                resultText = "Unknown action '$Action'"
+                state      = 'error'
+            }
+        }
+    }
+
+    $Body = @{
+        Results = $Results
+    }
+    if ($Metadata) {
+        $Body.Metadata = $Metadata
+    }
+
+    return ([HttpResponseContext]@{
+            StatusCode = [HttpStatusCode]::OK
+            Body       = $Body
+        })
+}

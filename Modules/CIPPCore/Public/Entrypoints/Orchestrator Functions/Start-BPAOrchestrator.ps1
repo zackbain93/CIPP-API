@@ -14,6 +14,12 @@ function Start-BPAOrchestrator {
     )
 
     try {
+        # Check feature flag
+        $FeatureFlag = Get-CIPPFeatureFlag -Id 'BestPracticeAnalyser'
+        if ($FeatureFlag -and $FeatureFlag.Enabled -eq $false) {
+            Write-LogMessage -API 'BestPracticeAnalyser' -message 'Best Practice Analyser is disabled via feature flag' -sev Info
+            return $false
+        }
         if ($TenantFilter -ne 'AllTenants') {
             Write-Verbose "TenantFilter: $TenantFilter"
             if ($TenantFilter -notmatch '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$') {
@@ -38,7 +44,7 @@ function Start-BPAOrchestrator {
             $TemplateRows = Get-CIPPAzDataTableEntity @BPATemplateTable -Filter $Filter
 
             if (!$TemplateRows) {
-                $null = Get-ChildItem 'Config\*.BPATemplate.json' | ForEach-Object {
+                $null = Get-ChildItem (Join-Path $env:CIPPRootPath 'Config\*.BPATemplate.json') | ForEach-Object {
                     $TemplateJson = Get-Content $_ | ConvertFrom-Json | ConvertTo-Json -Compress -Depth 10
                     $Entity = @{
                         JSON         = "$TemplateJson"
@@ -89,7 +95,7 @@ function Start-BPAOrchestrator {
                 OrchestratorName = 'BPAOrchestrator'
                 SkipLog          = $true
             }
-            return Start-NewOrchestration -FunctionName 'CIPPOrchestrator' -InputObject ($InputObject | ConvertTo-Json -Compress -Depth 5)
+            return Start-CIPPOrchestrator -InputObject $InputObject
         }
     } catch {
         $ErrorMessage = Get-CippException -Exception $_

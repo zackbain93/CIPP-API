@@ -22,7 +22,7 @@ function New-CIPPAuditLogSearchResultsCache {
             $message = "Skipping search ID: $SearchId for tenant: $TenantFilter - Previous attempt failed within the last 4 hours"
             Write-LogMessage -API 'AuditLog' -tenant $TenantFilter -message $message -Sev 'Info'
             Write-Information $message
-            exit 0
+            return $false
         }
     } catch {
         Write-Information "Error checking for failed downloads: $($_.Exception.Message)"
@@ -36,7 +36,7 @@ function New-CIPPAuditLogSearchResultsCache {
         $searchEntity = Get-CIPPAzDataTableEntity @CacheWebhooksTable -Filter "PartitionKey eq '$TenantFilter' and SearchId eq '$SearchId'"
         if ($searchEntity) {
             Write-Information "Search ID: $SearchId already cached for tenant: $TenantFilter"
-            exit 0
+            return $false
         }
 
         # Record this attempt in the FailedAuditLogDownloads table BEFORE starting the download
@@ -62,19 +62,36 @@ function New-CIPPAuditLogSearchResultsCache {
             $searchResults = Get-CippAuditLogSearchResults -TenantFilter $TenantFilter -QueryId $SearchId
             foreach ($searchResult in $searchResults) {
                 $cacheEntity = @{
-                    RowKey       = $searchResult.id
-                    PartitionKey = $TenantFilter
-                    SearchId     = $SearchId
-                    JSON         = [string]($searchResult | ConvertTo-Json -Depth 10)
+                    RowKey                = $searchResult.id
+                    PartitionKey          = $TenantFilter
+                    SearchId              = $SearchId
+                    JSON                  = [string]($searchResult | ConvertTo-Json -Depth 10)
+                    CippProcessing        = $false
+                    CippProcessingStarted = ''
                 }
                 Add-CIPPAzDataTableEntity @CacheWebhooksTable -Entity $cacheEntity -Force
             }
             Write-Information "Successfully cached search ID: $($SearchId) for tenant: $TenantFilter"
+
+            try {
+                $PrefetchIPs = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+                foreach ($sr in $searchResults) {
+                    $cip = $sr.auditData.clientip
+                    if (![string]::IsNullOrWhiteSpace($cip)) { $null = $PrefetchIPs.Add(([string]$cip).Trim()) }
+                }
+                if ($PrefetchIPs.Count -gt 0) {
+                    $null = Get-CIPPGeoIPLocationBatch -IPs @($PrefetchIPs)
+                    Write-Information "Geo prefetch: warmed cache for $($PrefetchIPs.Count) distinct IP(s) (search $SearchId)"
+                }
+            } catch {
+                Write-Information "Geo prefetch during ingestion failed for search ${SearchId}: $($_.Exception.Message)"
+            }
+
             try {
                 $FailedDownloadsTable = Get-CippTable -TableName 'FailedAuditLogDownloads'
                 $failedEntities = Get-CIPPAzDataTableEntity @FailedDownloadsTable -Filter "PartitionKey eq '$TenantFilter' and SearchId eq '$SearchId'"
                 if ($failedEntities) {
-                    Remove-AzDataTableEntity @FailedDownloadsTable -Entity $failedEntities -Force
+                    Remove-CIPPAzDataTableEntity @FailedDownloadsTable -Entity $failedEntities -Force
                     Write-Information "Removed failed download records for search ID: $SearchId, tenant: $TenantFilter"
                 }
             } catch {

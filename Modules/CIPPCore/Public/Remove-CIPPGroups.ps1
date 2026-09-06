@@ -8,46 +8,162 @@ function Remove-CIPPGroups {
         $UserID
     )
 
-    if (-not $userid) {
-        $UserID = (New-GraphGetRequest -uri "https://graph.microsoft.com/beta/users/$($Username)" -tenantid $TenantFilter).id
-    }
-    $AllGroups = (New-GraphGetRequest -uri "https://graph.microsoft.com/beta/groups/?`$select=displayName,mailEnabled,id,groupTypes,assignedLicenses&`$top=999" -tenantid $TenantFilter)
+    try {
 
-    $Returnval = (New-GraphPostRequest -uri "https://graph.microsoft.com/beta/users/$($UserID)/GetMemberGroups" -tenantid $TenantFilter -type POST -body '{"securityEnabledOnly": false}').value | ForEach-Object -Parallel {
-        Import-Module '.\Modules\AzBobbyTables'
-        Import-Module '.\Modules\CIPPCore'
-        $Group = $_
+        $BulkInfoRequests = [System.Collections.Generic.List[object]]::new()
 
-        try {
-            $GroupName = ($using:AllGroups | Where-Object -Property id -EQ $Group).displayName
-            $IsMailEnabled = ($using:AllGroups | Where-Object -Property id -EQ $Group).mailEnabled
-            $IsM365Group = $null -ne ($using:AllGroups | Where-Object { $_.id -eq $Group -and $_.groupTypes -contains 'Unified' })
-            $IsLicensed = ($using:AllGroups | Where-Object -Property id -EQ $Group).assignedLicenses.Count -gt 0
+        if (-not $UserID) {
+            $BulkInfoRequests.Add(@{
+                    id     = 'getUserID'
+                    method = 'GET'
+                    url    = "users/$($Username)?`$select=id"
+                })
+        }
+
+        $BulkInfoRequests.Add(
+            @{
+                id     = 'getAllGroups'
+                method = 'GET'
+                url    = "groups/?`$select=displayName,mailEnabled,id,groupTypes,assignedLicenses,onPremisesSyncEnabled,membershipRule&`$top=999"
+            })
+        $BulkInfoRequests.Add(@{
+                id     = 'getUserGroups'
+                method = 'GET'
+                url    = "users/$($UserID ?? $Username)/memberOf/microsoft.graph.group?`$select=id"
+            })
+
+        $BulkGetResults = New-GraphBulkRequest -tenantid $TenantFilter -Requests @($BulkInfoRequests)
+
+        $UserInfo = ($BulkGetResults | Where-Object { $_.id -eq 'getUserID' }).body
+        if ($UserInfo) {
+            $UserID = $UserInfo.id
+        }
+        $AllGroups = ($BulkGetResults | Where-Object { $_.id -eq 'getAllGroups' }).body.value
+        $UserGroups = ($BulkGetResults | Where-Object { $_.id -eq 'getUserGroups' }).body.value
+
+        #users/$($User.id)/memberOf/microsoft.graph.directoryRole
+        if (-not $UserGroups) {
+            $Returnval = "$($Username) is not a member of any groups."
+            Write-LogMessage -headers $Headers -API $APIName -message "$($Username) is not a member of any groups" -Sev 'Info' -tenant $TenantFilter
+            return $Returnval
+        }
+
+        Write-Information "Initiating group membership removal for user: $Username in tenant: $TenantFilter"
+
+        # Initialize bulk request arrays and results
+        $BulkRequests = [System.Collections.Generic.List[object]]::new()
+        $ExoBulkRequests = [System.Collections.Generic.List[object]]::new()
+        $GraphLogs = [System.Collections.Generic.List[object]]::new()
+        $ExoLogs = [System.Collections.Generic.List[object]]::new()
+        $Results = [System.Collections.Generic.List[string]]::new()
+
+        # Process each group and prepare bulk requests
+        foreach ($Group in $UserGroups) {
+            $GroupInfo = $AllGroups | Where-Object -Property id -EQ $Group.id
+            $GroupName = $GroupInfo.displayName
+            $IsMailEnabled = $GroupInfo.mailEnabled
+            $IsM365Group = $GroupInfo.groupTypes -and $GroupInfo.groupTypes -contains 'Unified'
+            $IsLicensed = $GroupInfo.assignedLicenses.Count -gt 0
+            $IsDynamic = -not [string]::IsNullOrWhiteSpace($GroupInfo.membershipRule)
 
             if ($IsLicensed) {
-                "Could not remove $($using:Username) from $GroupName. This is because the group has licenses assigned to it."
+                $Results.Add("Skipping removal of $Username from group '$GroupName' because it has assigned licenses. This group will be handled during the license removal step.")
+                Write-LogMessage -headers $Headers -API $APIName -message "Skipping removal of $Username from group '$GroupName' because it has assigned licenses. This group will be handled during the license removal step." -sev 'Info' -tenant $TenantFilter
+            } elseif ($IsDynamic) {
+                $Results.Add("Error: Could not remove $Username from group '$GroupName' because it is a Dynamic Group.")
+                Write-LogMessage -headers $Headers -API $APIName -message "Could not remove $Username from group '$GroupName' because it is a Dynamic Group." -sev 'Warning' -tenant $TenantFilter
+            } elseif ($GroupInfo.onPremisesSyncEnabled) {
+                $Results.Add("Error: Could not remove $Username from group '$GroupName' because it is synced with Active Directory.")
+                Write-LogMessage -headers $Headers -API $APIName -message "Could not remove $Username from group '$GroupName' because it is synced with Active Directory." -sev 'Warning' -tenant $TenantFilter
             } else {
-                if ($IsM365Group) {
-                    $null = New-GraphPostRequest -uri "https://graph.microsoft.com/beta/groups/$_/members/$($using:UserID)/`$ref" -tenantid $using:TenantFilter -type DELETE -body '' -Verbose
-                } elseif (-not $IsMailEnabled) {
-                    $null = New-GraphPostRequest -uri "https://graph.microsoft.com/beta/groups/$_/members/$($using:UserID)/`$ref" -tenantid $using:TenantFilter -type DELETE -body '' -Verbose
+                if ($IsM365Group -or (-not $IsMailEnabled)) {
+                    # Use Graph API for M365 Groups and Security Groups
+                    $BulkRequests.Add(@{
+                            id     = "removeFromGroup-$($Group.id)"
+                            method = 'DELETE'
+                            url    = "groups/$($Group.id)/members/$UserID/`$ref"
+                        })
+                    $GraphLogs.Add(@{
+                            message   = "Removed $Username from $GroupName"
+                            id        = "removeFromGroup-$($Group.id)"
+                            groupName = $GroupName
+                        })
                 } elseif ($IsMailEnabled) {
-                    $Params = @{ Identity = $GroupName; Member = $using:UserID ; BypassSecurityGroupManagerCheck = $true }
-                    New-ExoRequest -tenantid $using:tenantFilter -cmdlet 'Remove-DistributionGroupMember' -cmdParams $params -UseSystemMailbox $true
+                    # Use Exchange Online for Distribution Lists
+                    # OperationGuid ties this request to its result; see Resolve-CippExoBulkResult.
+                    # Every entry here shares the same target (the user being offboarded), so target
+                    # alone cannot tell one group's removal from another's.
+                    $OperationGuid = [Guid]::NewGuid().ToString()
+                    $Params = @{
+                        Identity                        = $GroupName
+                        Member                          = $UserID
+                        BypassSecurityGroupManagerCheck = $true
+                    }
+                    $ExoBulkRequests.Add(@{
+                            CmdletInput   = @{
+                                CmdletName = 'Remove-DistributionGroupMember'
+                                Parameters = $Params
+                            }
+                            OperationGuid = $OperationGuid
+                        })
+                    $ExoLogs.Add(@{
+                            message       = "Removed $Username from $GroupName"
+                            target        = $UserID
+                            groupName     = $GroupName
+                            OperationGuid = $OperationGuid
+                        })
                 }
+            }
+        }
+    } catch {
+        $ErrorMessage = Get-CippException -Exception $_
+        Write-LogMessage -headers $Headers -API $APIName -message "Error preparing bulk group removal requests: $($ErrorMessage.NormalizedError)" -Sev 'Error' -tenant $TenantFilter -LogData $ErrorMessage
+        return "Error preparing bulk group removal requests: $($ErrorMessage.NormalizedError)"
+    }
 
-                Write-LogMessage -headers $using:Headers -API $($using:APIName) -message "Removed $($using:Username) from $GroupName" -Sev 'Info' -tenant $using:TenantFilter
-                "Successfully removed $($using:Username) from group $GroupName"
+    # Execute Graph bulk requests
+    if ($BulkRequests.Count -gt 0) {
+        try {
+            $RawGraphRequest = New-GraphBulkRequest -tenantid $TenantFilter -scope 'https://graph.microsoft.com/.default' -Requests @($BulkRequests) -asapp $true
+
+            foreach ($GraphLog in $GraphLogs) {
+                $GraphError = $RawGraphRequest | Where-Object { $_.id -eq $GraphLog.id -and $_.status -notmatch '^2[0-9]+' }
+                if ($GraphError) {
+                    $Message = Get-NormalizedError -message $GraphError.body.error
+                    $Results.Add("Could not remove $Username from group '$($GraphLog.groupName)': $Message. This is likely because it's a Dynamic Group or synced with Active Directory")
+                    Write-LogMessage -headers $Headers -API $APIName -message "Could not remove $Username from group '$($GraphLog.groupName)': $Message" -Sev 'Error' -tenant $TenantFilter
+                } else {
+                    $Results.Add("Successfully removed $Username from group '$($GraphLog.groupName)'")
+                    Write-LogMessage -headers $Headers -API $APIName -message $GraphLog.message -Sev 'Info' -tenant $TenantFilter
+                }
             }
         } catch {
             $ErrorMessage = Get-CippException -Exception $_
-            Write-LogMessage -headers $using:Headers -API $($using:APIName) -message "Could not remove $($using:Username) from group $GroupName : $($ErrorMessage.NormalizedError)" -Sev 'Error' -tenant $using:TenantFilter -LogData $ErrorMessage
-            "Could not remove $($using:Username) from group $($GroupName): $($ErrorMessage.NormalizedError). This is likely because its a Dynamic Group or synched with active directory"
+            Write-Information "Error executing bulk Graph requests: $($ErrorMessage | ConvertTo-Json -Depth 5)"
         }
     }
-    if (-not $Returnval) {
-        $Returnval = "$($Username) is not a member of any groups."
-        Write-LogMessage -headers $Headers -API $APIName -message "$($Username) is not a member of any groups" -Sev 'Info' -tenant $TenantFilter
+
+    # Execute Exchange Online bulk requests
+    if ($ExoBulkRequests.Count -gt 0) {
+        try {
+            $RawExoRequest = New-ExoBulkRequest -tenantid $TenantFilter -cmdletArray @($ExoBulkRequests)
+            $ExoResults = Resolve-CippExoBulkResult -Response $RawExoRequest -Operations $ExoLogs
+
+            foreach ($ExoResult in $ExoResults) {
+                if ($ExoResult.Success) {
+                    $Results.Add("Successfully removed $Username from group $($ExoResult.Operation.groupName)")
+                    Write-LogMessage -headers $Headers -API $APIName -tenant $TenantFilter -message $ExoResult.Operation.message -Sev 'Info'
+                } else {
+                    $Results.Add("Could not remove $Username from $($ExoResult.Operation.groupName): $($ExoResult.ErrorMessage)")
+                    Write-LogMessage -headers $Headers -API $APIName -message "Could not remove $Username from $($ExoResult.Operation.groupName): $($ExoResult.ErrorMessage)" -Sev 'Error' -tenant $TenantFilter
+                }
+            }
+        } catch {
+            $ErrorMessage = Get-CippException -Exception $_
+            Write-LogMessage -headers $Headers -API $APIName -message "Error executing Exchange bulk requests: $($ErrorMessage.NormalizedError)" -Sev 'Error' -tenant $TenantFilter -LogData $ErrorMessage
+            $Results.Add("Error executing bulk Exchange requests: $($ErrorMessage.NormalizedError)")
+        }
     }
-    return $Returnval
+
+    return $Results
 }

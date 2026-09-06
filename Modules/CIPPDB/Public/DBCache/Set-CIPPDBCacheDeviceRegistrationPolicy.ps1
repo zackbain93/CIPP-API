@@ -1,0 +1,40 @@
+function Set-CIPPDBCacheDeviceRegistrationPolicy {
+    <#
+    .SYNOPSIS
+        Caches device registration policy for a tenant
+
+    .PARAMETER TenantFilter
+        The tenant to cache device registration policy for
+
+    .PARAMETER QueueId
+        The queue ID to update with total tasks (optional)
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$TenantFilter,
+        [string]$QueueId
+    )
+
+    try {
+        Write-LogMessage -API 'CIPPDBCache' -tenant $TenantFilter -message 'Caching device registration policy' -sev Debug
+
+        $DeviceRegistrationPolicy = New-GraphGetRequest -uri 'https://graph.microsoft.com/beta/policies/deviceRegistrationPolicy' -tenantid $TenantFilter
+
+        if ($DeviceRegistrationPolicy) {
+            Add-CIPPDbItem -TenantFilter $TenantFilter -Type 'DeviceRegistrationPolicy' -Data @($DeviceRegistrationPolicy) -AddCount
+            Write-LogMessage -API 'CIPPDBCache' -tenant $TenantFilter -message 'Cached device registration policy successfully' -sev Debug
+        } else {
+            # The request succeeded with nothing returned: write the authoritative empty set so the
+            # Count marker records a completed collection and stale rows are cleared.
+            Add-CIPPDbItem -TenantFilter $TenantFilter -Type 'DeviceRegistrationPolicy' -Data @() -AddCount -ClearOnEmpty
+            Write-LogMessage -API 'CIPPDBCache' -tenant $TenantFilter -message 'Cached 0 device registration policies (none found)' -sev Debug
+        }
+
+    } catch {
+        Write-LogMessage -API 'CIPPDBCache' -tenant $TenantFilter `
+            -message "Failed to cache device registration policy: $($_.Exception.Message)" `
+            -sev Warning `
+            -LogData (Get-CippException -Exception $_)
+    }
+}
